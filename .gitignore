@@ -1,0 +1,22 @@
+# ===== 密钥与私密配置（严禁入库）=====
+.env
+
+# ===== 本地数据 / 用户生成内容 =====
+studio.db
+static/uploads/
+static/temp/
+
+# ===== 日志 =====
+debug_prompts.log
+
+# ===== Python =====
+__pycache__/
+*.pyc
+
+# ===== 本地工作区文件 =====
+.workbuddy/
+*.genie
+
+# ===== 系统杂项 =====
+Thumbs.db
+Desktop.ini
