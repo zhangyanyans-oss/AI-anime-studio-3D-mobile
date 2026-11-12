@@ -3,6 +3,7 @@ import sys
 import json
 import re
 import io
+import time
 import base64
 import uuid
 import shutil
@@ -19,6 +20,7 @@ from openai import OpenAI
 import httpx
 from dotenv import load_dotenv
 import au_lexicon
+import oip as oip_lib  # Open Image Prompts 提示词库：语料检索 + 美术风格卡（只读，失败自动降级）
 
 # ---------- PyInstaller 打包支持 ----------
 # exe 双击运行时：切到 exe 所在目录（.env、static/uploads 等持久数据都放 exe 旁边），
@@ -65,6 +67,9 @@ deepseek_client = OpenAI(
 )
 
 DOUBAO_API_KEY = os.getenv("ARK_API_KEY")
+
+# ---------- 配音服务（VoxCPM 声音克隆微服务，独立进程用 VoxCPM venv 运行 voice_server.py） ----------
+VOICE_SERVER_URL = (os.getenv("VOICE_SERVER_URL") or "http://127.0.0.1:8021").rstrip("/")
 
 # ---------- 分区自定义密钥：请求级生效 ----------
 # 分区口令在 ⚙️ 设置页保存了自己的 key（存 user_settings 表）后，
@@ -161,12 +166,37 @@ def extract_json_text(content: str) -> str:
     return text
 
 def repair_json_text(text: str) -> str:
-    """轻量修复常见 JSON 瑕疵：全角/智能引号、尾逗号、中文冒号。"""
-    text = text.replace("\u201c", '"').replace("\u201d", '"')   # "" -> "
-    text = text.replace("\u2018", "'").replace("\u2019", "'")   # '' -> '
-    text = text.replace("\uff1a", ":").replace("\uff0c", ",")   # ：, ->
-    text = re.sub(r",\s*([}\]])", r"\1", text)                  # 去尾逗号
-    return text
+    """轻量修复常见 JSON 瑕疵：全角/智能引号、尾逗号、中文标点、字符串内的裸换行。
+    重要：只在字符串**外部**替换中文冒号/逗号，避免把提示词正文里的中文标点改掉。"""
+    out = []
+    in_str = False
+    esc = False
+    for ch in text:
+        if esc:
+            out.append(ch); esc = False; continue
+        if ch == "\\":
+            out.append(ch); esc = True; continue
+        if ch == '"':
+            in_str = not in_str; out.append(ch); continue
+        if in_str:
+            if ch in ("\u201c", "\u201d"):          # 字符串里的智能双引号 → 转义
+                out.append('\\"')
+            elif ord(ch) < 0x20:                     # 裸换行/制表符 → 转义（最常见的解析失败原因）
+                out.append({"\n": "\\n", "\r": "\\r", "\t": "\\t"}.get(ch, "\\u%04x" % ord(ch)))
+            else:
+                out.append(ch)
+        else:
+            if ch in ("\u201c", "\u201d"):
+                out.append('"')
+            elif ch == "\uff1a":
+                out.append(":")
+            elif ch == "\uff0c":
+                out.append(",")
+            else:
+                out.append(ch)
+    t = "".join(out)
+    t = re.sub(r",\s*([}\]])", r"\1", t)             # 去尾逗号
+    return t
 
 def parse_model_json(content: str, finish_reason: str | None = None) -> Any:
     """尽力解析模型返回的 JSON；失败抛 ValueError，错误信息带具体原因。"""
@@ -180,9 +210,20 @@ def parse_model_json(content: str, finish_reason: str | None = None) -> Any:
     for cand in candidates:
         try:
             return json.loads(cand)
-        except json.JSONDecodeError:
+        except json.JSONDecodeError as e:
+            last_err = e
             continue
-    raise ValueError(f"无法从模型输出中解析出 JSON（输出开头：{content[:80]!r}）")
+    # 解析失败时把原始输出留档，便于事后定位（含失败原因/结尾片段）
+    try:
+        with open("debug_model_json.log", "a", encoding="utf-8") as f:
+            f.write(f"\n===== {time.strftime('%m-%d %H:%M:%S')} 解析失败 finish_reason={finish_reason} "
+                    f"len={len(content)} err={last_err}\n{content}\n")
+    except Exception:
+        pass
+    raise ValueError(
+        f"无法从模型输出中解析出 JSON（finish_reason={finish_reason}，长度 {len(content)}，"
+        f"结尾：{content[-60:]!r}）"
+    )
 
 def deepseek_json(response) -> Any:
     """从 DeepSeek 响应对象中解析 JSON，失败抛 ValueError（带原因）。"""
@@ -200,8 +241,9 @@ AUTODL_WORKFLOW = os.getenv("AUTODL_WORKFLOW_ID", "minimax_h3_zm_u24")
 # ---------- 数据模型 ----------
 class StoryRequest(BaseModel):
     idea: str
-    image_base64: str | None = None 
+    image_base64: str | None = None
     chat_history: List[Dict[str, str]] | None = None
+    style_bible: str | None = None  # 用户在「风格库」预选的风格描述，生成时注入；空串表示直出
 
 class ImageRequest(BaseModel):
     prompt: str
@@ -243,6 +285,46 @@ class RegeneratePromptRequest(BaseModel):
     characters: List[Dict[str, Any]] | None = None  # [{name, image_prompt}] 角色外观锚点
     old_prompt: str | None = None          # 旧提示词（在其基础上重写）
     feedback: str | None = None            # 用户的新要求（最高优先级）
+
+# ---------- 0.9 Open Image Prompts 提示词库：检索参考 + 美术风格卡 ----------
+def _oip_reference_block(query: str, *, limit: int = 3) -> str:
+    """检索 2.3 万条真实提示词语料，格式化为可注入 LLM 的参考块。
+    任何失败（库缺失/检索异常）都返回空串，绝不拖垮主生成流程。"""
+    query = str(query or "").strip()
+    if not query:
+        return ""
+    try:
+        brief = oip_lib.reference_brief(query, limit=limit)
+    except Exception as exc:
+        print(f"[oip] 参考检索降级：{exc}")
+        return ""
+    if not brief:
+        return ""
+    lines = []
+    for item in brief["references"][:limit]:
+        zh = item.get("prompt_zh") or item.get("prompt_text") or ""
+        if zh:
+            lines.append(f"· （{item.get('tool') or '未知模型'}）{zh}")
+    if not lines:
+        return ""
+    return (
+        "\n【提示词库参考】以下是提示词库里与本题相关的真实优秀提示词节选（来源可追溯）。"
+        "只借鉴它们的镜头感、构图、光线与质感写法，禁止照抄其中的具体人物/地点/剧情设定：\n"
+        + "\n".join(lines)
+    )
+
+
+def _oip_style_card_block(*texts: str | None) -> str:
+    """按画风圣经/剧情挑选一张美术方向风格卡（img-gen-taste），注入美术指导。"""
+    try:
+        name = oip_lib.pick_card(*texts)
+        excerpt = oip_lib.card_excerpt(name)
+    except Exception as exc:
+        print(f"[oip] 风格卡降级：{exc}")
+        return ""
+    if not excerpt:
+        return ""
+    return f"\n【美术方向参考·{name}】以下是该题材方向的美术要点卡，撰写画面描述时参考其构图/光线/质感要点：\n{excerpt}"
 
 # ---------- 1. 头脑风暴接口 (完整版) ----------
 BRAINSTORM_SYSTEM_PROMPT = """你是一个专业的动画编剧与头脑风暴助手。
@@ -369,6 +451,20 @@ async def generate_story(req: StoryRequest):
         elif req.idea:
             prompt_text += f"故事想法：{req.idea}\n"
 
+        # 用户预选风格（风格库「用这套」暂存的描述）：最高优先级注入，剧本与全部提示词按此风格生成
+        if req.style_bible is not None:
+            if req.style_bible.strip():
+                prompt_text += f"\n【画风圣经（用户已锁定，必须严格执行）】{req.style_bible.strip()}\n剧本的 style_bible 字段原样输出该描述，所有分镜 image_prompt 必须符合该画风。\n"
+            else:
+                prompt_text += "\n【画风：用户选择直出，不要施加任何风格倾向，剧本的 style_bible 字段输出空字符串。】\n"
+
+        # 注入提示词库参考：语料检索（few-shot 参考）+ 风格卡（美术方向）。失败自动降级为空串。
+        _idea_text = req.idea or " ".join(
+            str((m or {}).get("content") or "") for m in (req.chat_history or []) if isinstance(m, dict)
+        )
+        prompt_text += _oip_reference_block(_idea_text, limit=3)
+        prompt_text += _oip_style_card_block(_idea_text)
+
         if prompt_text:
             user_content.append({"type": "text", "text": prompt_text})
         if req.image_base64:
@@ -415,6 +511,81 @@ async def generate_story(req: StoryRequest):
         raise HTTPException(e.status_code if isinstance(e, HTTPException) else 500, deepseek_friendly_error(e))
 
 # ---------- 2.5 单条提示词重生成（人物 / 场景 / 分镜） ----------
+# 界面下拉里用户手选的摄影参数（与前端 static/app.js 的 SHOT_PARAMS / MOVE_PARAMS 保持一致）。
+# 这些是硬约束：模型改写正文时很容易把它们揉成散文（"景别：远景"→"景别近景特写"），
+# 所以先提取出来当硬约束喂给模型，再从返回文本里清掉变体、重新拼成标准参数块。
+SHOT_PARAM_OPTS = {
+    "景别": ["大远景", "远景", "全景", "中景", "中近景", "近景", "特写", "大特写"],
+    "景深": ["超浅景深", "浅景深", "中等景深", "深景深"],
+    "机位": ["平视", "低角度仰拍", "高角度俯拍", "鸟瞰", "荷兰角", "过肩", "主观视角"],
+    # 焦段：长名与「35mm」这类短写都列上——模型改写时两种写法都可能出现
+    "焦段": ["14mm 超广角", "24mm 广角", "35mm 人文广角", "35mm", "50mm 标准", "50mm",
+             "85mm 中长焦", "85mm", "135mm 长焦", "135mm"],
+    "构图": ["三分法", "中心对称", "对角线", "框架式", "引导线", "前景遮挡", "大量留白"],
+    "光线": ["顺光", "侧光", "逆光轮廓光", "顶光", "底光", "伦勃朗光", "柔光散射", "硬光直射"],
+    "运镜": ["固定镜头", "缓缓推近", "缓缓拉远", "横移", "摇镜", "跟随", "环绕", "升降"],
+}
+# 这些组在提示词里天然是短促的标签式表述，可以容忍「无冒号」写法一并清理；
+# 光线/运镜则只清带冒号的标准写法，避免误伤「侧光从窗缝斜射下来」这类正文描述。
+_TIGHT_PARAM_LABELS = ("景别", "景深", "机位", "焦段", "构图")
+_SEP = "，,；;、。\n】"  # 含「】」，紧贴小节标题的参数写法（【镜头细节】景别：中景）也要能识别
+
+
+def _param_opts_alt(label: str) -> str:
+    opts = sorted(SHOT_PARAM_OPTS[label], key=len, reverse=True)  # 长词优先，避免「近景」吃掉「中近景」
+    return "|".join(re.escape(o) for o in opts)
+
+
+def _clean_param_text(text: str) -> str:
+    t = re.sub(r"([，,；;、])\s*[，,；;、]+", r"\1", text or "")
+    t = re.sub(r"[，,；;、]+\s*(?=[。])", "", t)      # 「，。」→「。」
+    t = re.sub(r"([。])\s*[，,；;、]+", r"\1", t)      # 「。，」→「。」
+    t = re.sub(r"】\s*[，,；;、]+", "】", t)           # 「【镜头细节】，机位…」→ 去掉小节标题后的孤立逗号
+    t = re.sub(r"^[，,；;、。\s]+", "", t)
+    t = re.sub(r"[，,；;、。\s]+$", "", t)
+    return t.strip()
+
+
+def extract_shot_params(text: str) -> Dict[str, str]:
+    """从提示词正文里读出用户在下拉中选定的参数（标准写法「标签：值」）。"""
+    out: Dict[str, str] = {}
+    src = text or ""
+    for label in SHOT_PARAM_OPTS:
+        m = re.search(rf"{re.escape(label)}\s*[:：]\s*([^{_SEP}]+)", src)
+        if m:
+            v = m.group(1).strip()
+            if v:
+                out[label] = v
+    return out
+
+
+def strip_shot_params(text: str, labels) -> str:
+    """清掉文本里指定各组的参数表述（含模型改写成的无冒号变体）。"""
+    t = text or ""
+    for label in labels:
+        lb = re.escape(label)
+        # ① 标准写法「标签：值」（值可能被模型换成不存在的词，一并清）
+        t = re.sub(rf"(^|[{_SEP}])\s*{lb}\s*[:：][^{_SEP}]*", r"\1", t)
+        # ② 无冒号但紧跟合法选项值：「景别近景特写」「景别为远景」
+        t = re.sub(rf"(^|[{_SEP}])\s*{lb}\s*(?:为|是)?\s*(?:{_param_opts_alt(label)})[^{_SEP}]*", r"\1", t)
+        # ③ 标签式变体：形如「机位略低仰拍」「构图主体居中带前景树根遮挡」这种以标签开头、
+        #    后面不再出现分隔符的短陈述（模型最爱在【约束】里重复一遍）。只对景别/景深/机位/焦段/构图生效，
+        #    光线/运镜不参与，避免误伤「侧光从窗缝斜射下来」这类正文描写。
+        if label in _TIGHT_PARAM_LABELS:
+            budget = 12 if label in ("景别", "机位", "构图") else 8
+            t = re.sub(
+                rf"(^|[{_SEP}])\s*{lb}\s*(?:为|是)?\s*[^{_SEP}]{{1,{budget}}}(?=[{_SEP}]|$)",
+                r"\1", t,
+            )
+    return _clean_param_text(t)
+
+
+def _param_block(params: Dict[str, str], labels) -> str:
+    """按固定顺序拼出标准参数块「景别：远景，机位：高角度仰拍」。"""
+    pairs = [f"{lb}：{params[lb]}" for lb in SHOT_PARAM_OPTS if lb in labels and lb in params]
+    return "，".join(pairs)
+
+
 REGEN_SYSTEM_PROMPT = """你是 AI 动画工作台的提示词重写引擎，负责把一条不够精细的生图提示词重写成工业级提示词。
 
 【画风圣经】用户会提供全片统一的画风描述（style_bible），重写后的 image_prompt 必须以它的原文开头，保证全片画风一致。
@@ -430,8 +601,12 @@ REGEN_SYSTEM_PROMPT = """你是 AI 动画工作台的提示词重写引擎，负
 【video_prompt 规范】仅分镜类型需要输出，单行输出：【动作时序】首先…然后…最后…(总时长=该镜头持续秒数)；【镜头运动】推/拉/摇/移/环绕/跟随/固定机位；【声音】仅当有明确声音需求时注明，没有就省略。画面起点即该分镜图。硬性禁止：引入分镜图中不存在的新人物/物体/场景；禁止“突然”“闪现”“切换到”等跳变词；不要复述静态外观。
 
 【用户修改要求】旧提示词是用户当前工作框内的内容，是最高优先级的内容来源：其中用户亲笔写下的具体细节（人物年龄、体型、五官、服装、随身物、动作、表情、地点、道具、光源、氛围、风格等）必须逐字保留，严禁替换、省略、泛化或"换种说法"。重写只允许做三件事：①把内容套进对应类型的结构化模板并分节；②补全模板要求但用户没写的维度（不确定的写【待补：说明】，禁止编造）；③语言规范化。若角色锚点与用户描述冲突，一律以用户描述为准；若旧提示词很短且明显是一句修改指令（如"换成雨夜"）而非完整提示词，将其整体视为用户的新要求，结合上下文重写出完整的结构化提示词。
+【描述框与提示词框冲突裁决】设定描述和旧提示词都是用户修改框里的最新手改内容；两者在基础设定（年龄/性别/身份/发型/体型/服装）上冲突时，以设定描述为准，把旧提示词里的过时版本改写成描述版本（例：描述写"26岁女性"而旧提示词写"16岁少女"，必须重写为26岁女性），这不算违背逐字保留原则——逐字保留只适用于与最新设定不冲突的细节；旧提示词里有而描述没提的细节（动作、构图、随身物等）仍然逐字保留。
+【画风圣经优先级】画风圣经是硬约束，优先级高于旧提示词里的画风描述：重写后的 image_prompt 必须以画风圣经原文开头；若旧提示词中的风格措辞与画风圣经冲突，以圣经为准更新（其余用户细节仍按上一条逐字保留）。用户没提供画风圣经时才按旧提示词原有风格写。
 【追加的指令要落实】用户在框内追加或修改的指令式短句（如"空镜头""不要人物""去掉XX""换成雨夜""加一面镜子"）是用户新要求：必须把它落实为规范中对应位置的具体描述（例如"空镜头"落实为"大远景空镜（画面中无人物）"，并保证全文没有任何人物痕迹），而不是把原句原样缀在提示词结尾；落实完成后提示词里不得残留指令原文。判断依据：该短句与提示词其余部分风格割裂、位置突兀（多为结尾），或描述的是"要改什么"而不是"画面里有什么"。
 
+【用户指定摄影参数是硬约束】用户消息里若给出「已指定的摄影参数」，这些值优先级最高：在【镜头细节】/【光源】等小节里必须**逐字使用这些词**（指定"景别=远景"就写"景别远景"，指定"机位=高角度仰拍"就写"机位高角度仰拍"），严禁换成近义词、近似的自造说法（不得写成"近景特写""略低仰拍"）、严禁拆分或合并；提示词其他位置也不得出现与这些参数矛盾的景别/景深/机位/焦段/构图/光线描述。指定的参数不出现在旧提示词里，你仍要主动把它们写进对应小节。
+【景别决定构图，必须落到画面描述里】景别不是标签，是要真画出来的构图。重写时【画面内容】**开头第一句先交代景别与主体在画面中的比例**（例："大远景，人物只是废墟中的一个小点"），再按景别分配主体与环境的篇幅：景别为**大远景**时，画面以大环境/远景全貌为主体，人物缩得很小（约画面高度不到10%，可能只是剪影或背影），环境尺度、天空、地貌、建筑体量要写足，**严禁描写面部五官/表情/服装细节**（写了就会把人物画大），人物只需交代位置与姿态；**远景**时人物较小（约画面高度20%），四周必须留出大量环境，同样不写五官细节；**全景**才是全身完整入画，从此档起才可以写表情与服装。若焦段与景别冲突（如远景配85mm以上长焦会压缩空间、把人物拉近显大），以景别为准仍要写出人物在画面中的小比例，仅在【镜头细节】保留指定焦段数值。
 【待补占位规则】若旧提示词含有【待补：xx】，而用户的新要求没有给出对应信息，则原样保留该【待补：xx】（可以写得更具体），不要替用户拍板编造；用户在新要求里明确了的内容，必须替换掉对应的【待补】。
 【素材与资产】素材引用（参考图/音频/视频）与全局设定（资产库）是创作者的输入，不由你生成、不要虚构；相关需求写进【约束】或【待补】。
 
@@ -446,6 +621,11 @@ async def regenerate_prompt(req: RegeneratePromptRequest):
         raise HTTPException(400, "type 必须是 character / scene / prop / storyboard")
 
     type_label = {"character": "角色设定图", "scene": "场景设定空镜", "prop": "道具设定图", "storyboard": "分镜图"}[t]
+    # 界面下拉手选的参数：先提取出来，作为硬约束单独下发，并从旧提示词里摘掉
+    picked = extract_shot_params(req.old_prompt)
+    img_picked = {k: v for k, v in picked.items() if k != "运镜"}
+    vid_picked = {"运镜": picked["运镜"]} if picked.get("运镜") else {}
+    old_prompt_clean = strip_shot_params(req.old_prompt, list(picked)) if picked else (req.old_prompt or "")
     user_lines = []
     if req.style_bible:
         user_lines.append(f"画风圣经（重写后必须以其原文开头）：{req.style_bible}")
@@ -464,35 +644,86 @@ async def regenerate_prompt(req: RegeneratePromptRequest):
     if req.name:
         user_lines.append(f"名称：{req.name}")
     if req.description:
-        user_lines.append(f"内容说明（剧情背景参考，若与用户当前版本的提示词冲突，以提示词为准）：{req.description}")
+        if t == "storyboard":
+            user_lines.append(f"剧情作用（导演在修改框里最新手改的剧情意图；与旧提示词冲突时以本条为准更新画面内容）：{req.description}")
+        else:
+            user_lines.append(f"设定描述（用户在设定框里最新手改的权威设定；与旧提示词冲突时以本条为准：年龄/性别/身份/发型/体型/服装等基础设定必须改写成与描述一致，不得保留过时版本）：{req.description}")
     if t == "storyboard":
         user_lines.append(f"台词（仅用于理解剧情，禁止写进画面）：{req.dialogue or '（无）'}")
         user_lines.append(f"该镜头时长：{req.duration} 秒")
-    if req.old_prompt:
-        user_lines.append(f"用户当前版本的提示词（最高优先级，其中用户写下的具体细节必须逐字保留）：{req.old_prompt}")
+    if old_prompt_clean:
+        user_lines.append(f"用户当前版本的提示词（其中与最新设定不冲突的细节必须逐字保留；基础设定与设定描述冲突时按描述改写）：{old_prompt_clean}")
+    if img_picked or vid_picked:
+        lines = [f"{k}={v}" for k, v in {**img_picked, **vid_picked}.items()]
+        user_lines.append(
+            "用户已在界面下拉中手动指定以下摄影参数（最高优先级硬约束，必须逐字使用、不得改写）："
+            + "；".join(lines)
+            + "。要求：①生图提示词里必须出现这些参数的原词（可写在【镜头细节】【光源】等小节，写法如「景别远景」「机位高角度仰拍」）；"
+            "②严禁用近义词或自造说法替换（不得把「远景」写成「近景特写」，不得把「高角度仰拍」写成「略低仰拍」）；"
+            "③提示词任何位置都不得出现与这些参数冲突的其他景别/景深/机位/焦段/构图/光线描述。"
+            + ("；④运镜参数只用于 video_prompt 的【镜头运动】小节。" if vid_picked else "")
+        )
     if req.feedback:
         user_lines.append(f"用户的新要求（最高优先级，必须落实）：{req.feedback}")
 
+    # 提示词库参考：语料检索 + 风格卡（失败自动降级，不影响重写主流程）
+    _ref_query = " ".join(
+        str(x or "").strip() for x in (req.description, req.old_prompt, req.feedback, req.synopsis) if x
+    )
+    _ref_block = _oip_reference_block(_ref_query, limit=3)
+    if _ref_block:
+        user_lines.append(_ref_block)
+    _card_block = _oip_style_card_block(req.style_bible, req.synopsis, req.description, req.feedback)
+    if _card_block:
+        user_lines.append(_card_block)
+
     try:
-        response = _dsk().chat.completions.create(
-            model="deepseek-chat",
-            messages=[
-                {"role": "system", "content": REGEN_SYSTEM_PROMPT},
-                {"role": "user", "content": "\n".join(user_lines)},
-            ],
-            response_format={"type": "json_object"},
-            max_tokens=1500,
-            temperature=0.8,
-        )
-        data = deepseek_json(response)
+        messages = [
+            {"role": "system", "content": REGEN_SYSTEM_PROMPT},
+            {"role": "user", "content": "\n".join(user_lines)},
+        ]
+        data = None
+        last_err = None
+        for attempt in range(2):  # 解析失败时补一句提醒重试一次，比直接报错友好
+            response = _dsk().chat.completions.create(
+                model="deepseek-chat",
+                messages=messages,
+                response_format={"type": "json_object"},
+                max_tokens=3000,
+                temperature=0.8 if attempt == 0 else 0.3,
+            )
+            try:
+                data = deepseek_json(response)
+                break
+            except ValueError as e:
+                last_err = e
+                print(f"[regenerate-prompt] 第 {attempt + 1} 次解析失败：{e}")
+                if attempt == 0:
+                    messages = messages + [
+                        {"role": "assistant", "content": "(上一次输出不是合法 JSON)"},
+                        {"role": "user", "content": "上一次输出不是合法 JSON（可能被截断或含未转义字符）。"
+                                                    "请重新输出，严格只输出一个 JSON 对象："
+                                                    '{"image_prompt": "...", "video_prompt": "..."}，'
+                                                    "不要 markdown 代码块、不要换行、不要任何额外文字。"},
+                    ]
+        if data is None:
+            raise HTTPException(500, f"重新生成失败：模型输出不是合法 JSON，请重试（{last_err}）")
         image_prompt = str(data.get("image_prompt") or "").strip()
         if not image_prompt:
             raise HTTPException(500, "重新生成失败：模型未返回提示词，请重试")
+        video_prompt = str(data.get("video_prompt") or "").strip() if t == "storyboard" else ""
+        # 回落保障：模型若把用户手选的参数改写成散文，统一清掉变体后重新拼成标准参数块，
+        # 保证「手动选择 > AI 生成」这条优先级在任何情况下都成立。
+        if img_picked:
+            body = strip_shot_params(image_prompt, list(img_picked))
+            blk = _param_block(img_picked, SHOT_PARAM_OPTS.keys())
+            image_prompt = (body + "，" + blk) if body else blk
+        if vid_picked and video_prompt:
+            body = strip_shot_params(video_prompt, ["运镜"])
+            blk = "运镜：" + vid_picked["运镜"]
+            video_prompt = (body + "，" + blk) if body else blk
         log_prompt("重生成提示词", image_prompt, f"type={t}")
-        return {
-            "image_prompt": image_prompt,
-            "video_prompt": str(data.get("video_prompt") or "").strip() if t == "storyboard" else "",
-        }
+        return {"image_prompt": image_prompt, "video_prompt": video_prompt}
     except ValueError as e:
         print(f"[regenerate-prompt] 输出解析失败：{e}")
         raise HTTPException(500, "DeepSeek 返回的不是合法 JSON，请重试")
@@ -500,6 +731,45 @@ async def regenerate_prompt(req: RegeneratePromptRequest):
         raise
     except Exception as e:
         raise HTTPException(e.status_code if isinstance(e, HTTPException) else 500, deepseek_friendly_error(e))
+
+# ---------- 2.55 提示词库检索 API（前端「提示词库」面板 + 状态探针） ----------
+class PromptSearchRequest(BaseModel):
+    q: str
+    limit: int = 8
+
+@app.get("/api/prompt-library/status")
+async def prompt_library_status():
+    """语料库就绪状态（未配置 OIP_DB_PATH 时 ready=false，前端隐藏检索面板入口）。"""
+    return oip_lib.corpus_status()
+
+@app.post("/api/prompt-search")
+async def prompt_search(req: PromptSearchRequest):
+    """中英双语提示词检索：自然语言 → v2 视觉标签 → 语料打分排序，结果可追溯来源。"""
+    q = (req.q or "").strip()[:200]
+    if not q:
+        raise HTTPException(400, "请输入搜索内容，例如：黄昏公园逆光人物剪影 / neon alley portrait")
+    try:
+        payload = oip_lib.search_corpus(q, limit=max(1, min(int(req.limit or 8), 20)), max_prompt_chars=1200)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except Exception as e:
+        raise HTTPException(503, f"提示词库暂不可用：{e}")
+    return oip_lib.slim_results(payload, zh_chars=800, prompt_chars=600)
+
+@app.get("/api/style-cards")
+async def style_cards():
+    """美术方向风格卡列表（img-gen-taste 移植版）：id + 标题 + 一句话摘要。"""
+    return {"cards": oip_lib.card_list()}
+
+@app.get("/api/style-cards/{name}")
+async def style_card_detail(name: str):
+    """单张风格卡完整要点。name 限字母/连字符，防路径穿越。"""
+    if not re.fullmatch(r"[a-z0-9-]{2,40}", name):
+        raise HTTPException(400, "非法卡片名")
+    card = oip_lib.card_full(name)
+    if not card:
+        raise HTTPException(404, "风格卡不存在")
+    return card
 
 # ---------- 2.6 调度参考图提示词：俯视调度图 / 轨迹调度图（供分镜生成视频时给 AI 参考） ----------
 class TopViewRequest(BaseModel):
@@ -2746,6 +3016,225 @@ async def upload_image(req: UploadImageRequest):
         f.write(img_bytes)
     return {"image_url": f"/static/uploads/{filename}"}
 
+# ---------- 3.5 配音：VoxCPM 声音克隆 / 文本转语音（语音服务独立进程，未启动时端点明确报错不拖垮主流程） ----------
+class UploadVoiceRequest(BaseModel):
+    audio_base64: str
+    filename: str | None = None
+
+class GenerateDubRequest(BaseModel):
+    text: str
+    voice_url: str | None = None        # 角色音色参考音频（/static/uploads/voice_*.wav），空 = 默认音色
+    voice_text: str | None = None       # 参考音频的文字内容（克隆必填）
+    preset_id: str | None = None        # 预设音色 ID（voice_presets.json 里的 id），如 preset_yj
+    cfg_value: float = 2.0
+    inference_timesteps: int = 10
+
+# 预设音色包：static/voice_presets/ 下 mp3 样本 + manifest（Edge TTS 生成的高质量中文人声，作 VoxCPM 克隆源）
+def _load_voice_presets() -> dict:
+    try:
+        with open("static/voice_presets/manifest.json", "r", encoding="utf-8") as f:
+            items = json.load(f)
+        return {p["id"]: p for p in items if p.get("id") and p.get("file")}
+    except Exception:
+        return {}
+
+@app.get("/api/voice/presets")
+async def voice_presets():
+    """预设音色列表（配音抽屉下拉框用）"""
+    items = _load_voice_presets()
+    out = []
+    for pid, p in items.items():
+        fp = os.path.join("static/voice_presets", p["file"])
+        out.append({"id": pid, "label": p.get("label", pid), "exists": os.path.isfile(fp)})
+    return {"presets": [p for p in out if p["exists"]]}
+
+_VOICE_AUDIO_EXT = (".wav", ".mp3", ".m4a", ".aac", ".ogg", ".flac")
+
+def _voice_file_ok(name: str) -> bool:
+    return name.lower().endswith(_VOICE_AUDIO_EXT)
+
+async def _voice_server_call(path: str, payload: dict, timeout: float = 300.0) -> dict:
+    """调用 VoxCPM 配音微服务；未启动/超时给出人话提示。"""
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            r = await client.post(f"{VOICE_SERVER_URL}{path}", json=payload)
+    except (httpx.ConnectError, httpx.ConnectTimeout):
+        raise HTTPException(503, "配音服务还没就绪：在线版首次部署需自动下载模型（约几分钟），请稍后重试；本地版需先启动 voice_server.py")
+    except httpx.HTTPError as e:
+        raise HTTPException(502, f"配音服务连接异常：{type(e).__name__}")
+    if r.status_code >= 400:
+        try: detail = r.json().get("detail", f"配音服务错误（HTTP {r.status_code}）")
+        except Exception: detail = f"配音服务错误（HTTP {r.status_code}）"
+        raise HTTPException(r.status_code if r.status_code != 500 else 502, detail)
+    return r.json()
+
+async def _voice_net_probe() -> dict:
+    """探测沙箱外网出口与内存上限（诊断权重下载/加载被杀用）"""
+    import httpx as _hx
+    out = {}
+    targets = {"pypi": "https://pypi.org/simple/", "hf-mirror": "https://hf-mirror.com",
+               "modelscope": "https://modelscope.cn", "hf": "https://huggingface.co"}
+    try:
+        async with _hx.AsyncClient(timeout=3) as c:
+            for name, url in targets.items():
+                try:
+                    r = await c.head(url, follow_redirects=True)
+                    out[name] = r.status_code
+                except Exception as e:
+                    out[name] = f"ERR:{type(e).__name__}"
+    except Exception as e:
+        out["probe"] = f"ERR:{type(e).__name__}"
+    # 内存：cgroup v2 / v1 限额 + /proc/meminfo
+    try:
+        for p, key in (("/sys/fs/cgroup/memory.max", "cgroup_max"),
+                       ("/sys/fs/cgroup/memory/memory.limit_in_bytes", "cgroup_max_v1")):
+            try:
+                out[key] = open(p).read().strip()
+            except Exception:
+                pass
+        for line in open("/proc/meminfo"):
+            if line.startswith(("MemTotal", "MemAvailable")):
+                k, v = line.split(":", 1)
+                out["mem_" + k] = v.strip()
+    except Exception:
+        pass
+    return out
+
+def _weights_progress_mb() -> float:
+    """models/VoxCPM-0.5B 目录已下载的字节数（MB，诊断下载进度用）"""
+    total = 0.0
+    try:
+        d = os.path.join("static", "..", "models", "VoxCPM-0.5B")
+        d = os.path.normpath(d)
+        if os.path.isdir(d):
+            for n in os.listdir(d):
+                try: total += os.path.getsize(os.path.join(d, n))
+                except OSError: pass
+    except Exception:
+        pass
+    return round(total / 1024 / 1024, 1)
+
+@app.get("/api/voice/status")
+async def voice_status():
+    """探测配音微服务是否在线（设置页展示用；探测失败静默降级为未就绪）"""
+    try:
+        async with httpx.AsyncClient(timeout=2.5) as client:
+            r = await client.get(f"{VOICE_SERVER_URL}/health")
+        tail = ""
+        try:
+            with open("voice_server.log", "r", encoding="utf-8", errors="replace") as f:
+                tail = "\n".join(f.read().splitlines()[-10:])[-1500:]
+        except Exception:
+            pass
+        return {**r.json(), "ready": bool(r.json().get("ready")), "weights_mb": _weights_progress_mb(), "log_tail": tail}
+    except Exception:
+        tail = ""
+        try:
+            with open("voice_server.log", "r", encoding="utf-8", errors="replace") as f:
+                lines = f.read().splitlines()
+            tail = "\n".join(lines[-15:])[-2000:]
+        except Exception:
+            pass
+        net = await _voice_net_probe()
+        return {"ready": False, "warming": False, "model": "VoxCPM-0.5B", "device": "cpu", "log_tail": tail, "net": net, "weights_mb": _weights_progress_mb()}
+
+@app.post("/api/upload-voice")
+async def upload_voice(req: UploadVoiceRequest):
+    """上传角色音色参考音频（克隆素材），存为 voice_*.<ext>"""
+    b64 = req.audio_base64.strip()
+    if b64.startswith("data:"):
+        b64 = b64.split(",", 1)[1] if "," in b64 else ""
+    try:
+        audio = base64.b64decode(b64)
+    except Exception:
+        raise HTTPException(400, "音频数据无效")
+    if len(audio) < 1000:
+        raise HTTPException(400, "音频内容为空或损坏")
+    if len(audio) > 15 * 1024 * 1024:
+        raise HTTPException(400, "参考音频超过 15MB，请裁剪到 5-20 秒再上传")
+    ext = os.path.splitext(req.filename or ".wav")[1].lower()
+    if ext not in _VOICE_AUDIO_EXT:
+        ext = ".wav"
+    filename = f"voice_{uuid.uuid4().hex}{ext}"
+    with open(os.path.join("static/uploads", filename), "wb") as f:
+        f.write(audio)
+    return {"voice_url": f"/static/uploads/{filename}"}
+
+# ---------- 配音异步任务（云端 CPU 合成 1-3 分钟，超过网关超时，必须后台执行） ----------
+_dub_jobs: Dict[str, Dict[str, Any]] = {}
+_dub_jobs_lock = __import__("threading").Lock()
+
+def _dub_job_gc():
+    now = _time.time()
+    with _dub_jobs_lock:
+        for jid in [j for j, v in _dub_jobs.items() if now - v.get("created", now) > 1800]:
+            _dub_jobs.pop(jid, None)
+
+def _dub_job_run(job_id: str, payload: dict):
+    """后台线程：调配音微服务合成并存文件（同步 httpx，独立于请求生命周期）"""
+    try:
+        with httpx.Client(timeout=600.0) as client:
+            r = client.post(f"{VOICE_SERVER_URL}/tts", json=payload)
+        if r.status_code >= 400:
+            try: detail = r.json().get("detail", f"配音服务错误（HTTP {r.status_code}）")
+            except Exception: detail = f"配音服务错误（HTTP {r.status_code}）"
+            raise RuntimeError(detail)
+        result = r.json()
+        wav = base64.b64decode(result["audio_b64"])
+        filename = f"dub_{uuid.uuid4().hex}.wav"
+        with open(os.path.join("static/uploads", filename), "wb") as f:
+            f.write(wav)
+        with _dub_jobs_lock:
+            _dub_jobs[job_id].update(status="done", audio_url=f"/static/uploads/{filename}",
+                                     sample_rate=result.get("sample_rate"))
+    except Exception as e:
+        with _dub_jobs_lock:
+            _dub_jobs[job_id].update(status="error", detail=f"{type(e).__name__}: {e}" if not isinstance(e, RuntimeError) else str(e))
+
+@app.post("/api/generate-dub")
+async def generate_dub(req: GenerateDubRequest):
+    """为分镜台词生成配音：提交后台任务立即返回 job_id（前端轮询 /api/dub-result 取结果）"""
+    text = (req.text or "").strip()
+    if not text:
+        raise HTTPException(400, "台词为空：先在分镜里填写台词 / 旁白")
+    if len(text) > 500:
+        raise HTTPException(400, "台词过长（最多 500 字），请拆分或精简")
+
+    payload = {
+        "text": text,
+        "cfg_value": req.cfg_value,
+        "inference_timesteps": req.inference_timesteps,
+    }
+    voice_path = local_static_path(req.voice_url) if req.voice_url else None
+    if not voice_path and req.preset_id:
+        # 预设音色：直接读 static/voice_presets/ 下的样本（不用上传）
+        preset = _load_voice_presets().get(req.preset_id)
+        if not preset:
+            raise HTTPException(400, "预设音色不存在或不可用")
+        voice_path = os.path.join("static/voice_presets", preset["file"])
+        req.voice_text = preset.get("prompt_text") or req.voice_text
+    if voice_path:
+        with open(voice_path, "rb") as f:
+            payload["prompt_wav_b64"] = base64.b64encode(f.read()).decode("ascii")
+        payload["prompt_text"] = (req.voice_text or "").strip()
+        if not payload["prompt_text"]:
+            raise HTTPException(400, "该音色缺少参考文本：请在角色设定里填写「音色参考文本」（参考音频里说的那句话）")
+
+    _dub_job_gc()
+    job_id = uuid.uuid4().hex
+    with _dub_jobs_lock:
+        _dub_jobs[job_id] = {"status": "pending", "created": _time.time()}
+    __import__("threading").Thread(target=_dub_job_run, args=(job_id, payload), daemon=True).start()
+    return {"job_id": job_id, "status": "pending"}
+
+@app.get("/api/dub-result")
+async def dub_result(job_id: str = Query(...)):
+    with _dub_jobs_lock:
+        job = _dub_jobs.get(job_id)
+        if not job:
+            raise HTTPException(404, "任务不存在或已过期")
+        return {k: v for k, v in job.items() if k != "created"}
+
 # ---------- 3.6 聊天附件解析（txt/md/pdf/docx → 纯文本，供剧本对话引用） ----------
 @app.post("/api/extract-file")
 async def extract_file(file: UploadFile = File(...)):
@@ -3699,7 +4188,7 @@ async def save_project(pid: str, request: Request, req: ProjectSaveRequest):
 
 # ---------- 删除同步：界面删除图片/视频/项目时，服务器文件一并清理 ----------
 # 命名白名单：只允许删除本应用生成的上传文件（img_/video_/diagram_*），防路径穿越与误删
-_UPLOAD_RE = re.compile(r"^(img|video|diagram_topview|diagram_trajectory)_[0-9a-f]{6,40}\.(jpg|jpeg|png|webp|gif|mp4)$", re.I)
+_UPLOAD_RE = re.compile(r"^(img|video|diagram_topview|diagram_trajectory|voice|dub)_[0-9a-f]{6,40}\.(jpg|jpeg|png|webp|gif|mp4|wav|mp3|m4a|aac|ogg|flac)$", re.I)
 
 def _collect_upload_urls(obj, out):
     """递归收集 JSON 数据里引用的所有 /static/uploads/ 文件 URL"""
@@ -3835,9 +4324,79 @@ app.mount("/static", StaticFiles(directory="static"), name="assets")
 # 再把根路径映射到前端页面（保持 html=True 以便访问 / 时自动返回 index.html）
 app.mount("/", StaticFiles(directory="static", html=True), name="static")
 
+# ---------- 配音微服务自动拉起 ----------
+# 背景：voice_server.py 是独立进程（VoxCPM 依赖装在单独的 venv 里），
+# 直接 `python main.py` 启动时它不会跟着起来，配音/声音克隆就会静默没有声音。
+# 这里在主服务启动时探测端口，没起来就用「装好 voxcpm 的解释器」拉起一个，
+# 让单条命令也能用全部功能。launch.py 会传 VOICE_AUTOSTART=0 避免重复启动。
+def _port_listening(host: str, port: int, timeout: float = 0.8) -> bool:
+    import socket
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    try:
+        return s.connect_ex((host, port)) == 0
+    finally:
+        try: s.close()
+        except Exception: pass
+
+
+def _voice_python_candidates():
+    """候选解释器：VOICE_PYTHON 环境变量 → 邻近 VoxCPM venv → 项目内 venv → 当前解释器"""
+    env_py = (os.getenv("VOICE_PYTHON") or "").strip()
+    if env_py:
+        yield env_py
+    base = os.path.dirname(os.path.abspath(__file__))
+    for rel in (("..", "VoxCPM-main", "venv", "Scripts", "python.exe"),
+                ("..", "VoxCPM-main", "venv", "bin", "python"),
+                ("venv", "Scripts", "python.exe"),
+                ("venv", "bin", "python")):
+        yield os.path.normpath(os.path.join(base, *rel))
+    yield sys.executable
+
+
+def maybe_autostart_voice():
+    """配音服务不在线时自动拉起（失败只提示，不影响主服务）"""
+    if (os.getenv("VOICE_AUTOSTART") or "1").strip() in ("0", "false", "False", "no"):
+        return
+    from urllib.parse import urlparse
+    u = urlparse(VOICE_SERVER_URL)
+    host = u.hostname or "127.0.0.1"
+    port = u.port or 8021
+    if host not in ("127.0.0.1", "localhost", "0.0.0.0"):
+        return  # 远端配音服务，不本地拉起
+    if _port_listening("127.0.0.1", port):
+        print(f"[voice] 配音服务已在线（:{port}）", flush=True)
+        return
+    import subprocess
+    for py in _voice_python_candidates():
+        if not (py and os.path.isfile(py)):
+            continue
+        try:
+            ok = subprocess.run([py, "-c", "import voxcpm, soundfile"],
+                                capture_output=True, timeout=180).returncode == 0
+        except Exception:
+            continue
+        if not ok:
+            continue
+        try:
+            logf = open("voice_server.log", "ab", buffering=0)
+            subprocess.Popen(
+                [py, "-u", "voice_server.py"],
+                cwd=os.path.dirname(os.path.abspath(__file__)) or ".",
+                stdout=logf, stderr=subprocess.STDOUT,
+                env={**os.environ, "VOXCPM_PORT": str(port)},
+            )
+            print(f"[voice] 已自动拉起配音服务（:{port}，模型加载约 1-2 分钟）", flush=True)
+        except Exception as e:
+            print(f"[voice] 配音服务自动启动失败: {type(e).__name__}: {e}", flush=True)
+        return
+    print("[voice] 未找到装好 voxcpm 的解释器，配音需手动启动 voice_server.py（见设置页说明）", flush=True)
+
+
 if __name__ == "__main__":
     import uvicorn
     # 启动时清理一次旧文件
     clean_temp_files()
+    maybe_autostart_voice()
     # 云托管沙箱通过 PORT 环境变量注入端口；本地默认 8010
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8010")))

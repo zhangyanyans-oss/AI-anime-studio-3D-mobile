@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, user-scalable=no">
 <meta name="theme-color" content="#4f46e5">
 <title>AI 动画工作台 · 手机版</title>
-<link rel="stylesheet" href="/static/mobile.css?v=13">
+<link rel="stylesheet" href="/static/mobile.css?v=22">
 <script type="importmap">
 {
   "imports": {
@@ -93,6 +93,7 @@
           <h2>从一个点子开始</h2>
           <p>写下你脑海中的画面，AI 帮你聊成完整剧本、分镜和成片。</p>
         </div>
+        <div id="pending-style" class="pending-style hidden"></div>
         <div class="mode-card" onclick="openIdeaInput()">
           <div class="mode-icon">✍️</div>
           <div class="mode-text"><b>直接写点子</b><span>一句话，AI 直接生成全片剧本</span></div>
@@ -128,13 +129,28 @@
           <p class="synopsis" id="story-synopsis"></p>
         </div>
         <div class="card pad">
-          <div class="sec-title">画风圣经 <span class="sec-hint">全片画风统一锁定</span> <button class="mini-edit" onclick="editStyleBible()">✏️ 编辑</button></div>
+          <div class="sec-title">画风圣经 <span class="sec-hint">全片画风统一锁定</span> <button class="mini-edit" onclick="setTab('styles')">🎨 风格库</button> <button class="mini-edit" onclick="editStyleBible()">✏️ 编辑</button></div>
           <p class="style-bible" id="story-style"></p>
         </div>
         <div class="stat-row" id="story-stats"></div>
         <button class="btn btn-primary btn-block" onclick="syncBoardsToStory()">🔄 按最新梗概 / 画风一键更新分镜</button>
         <button class="btn btn-ghost btn-block" id="btn-brainstorm-toggle" onclick="toggleBrainstorm()">💬 头脑风暴对话（点此展开/收起，可继续和 AI 聊）</button>
         <button class="btn btn-ghost btn-block" onclick="regenStory()">🔄 重新生成剧本（会覆盖分镜进度）</button>
+      </div>
+    </section>
+
+    <!-- 风格库 -->
+    <section class="tab-page hidden" id="tab-styles">
+      <div class="seg" id="style-cat-seg"></div>
+      <div id="style-gallery" class="style-gallery"></div>
+      <div class="card pad">
+        <div class="sec-title">进阶参考 · 美术方向要点卡 <button class="mini-edit" id="oip-toggle-btn" onclick="toggleOipCards()">展开 ▾</button></div>
+        <p class="sec-hint" style="margin:4px 0 8px;">39 张深度要点卡（构图/光线/材质），来自 2.3 万条真实提示词蒸馏，适合写提示词时参考</p>
+        <div id="styles-list" class="sc-list hidden"></div>
+      </div>
+      <div class="card pad" id="prompt-lib-card">
+        <div class="sec-title">提示词库 <span class="sec-hint">2.3 万条真实优秀提示词 · 中英检索 · 来源可追溯</span></div>
+        <button class="btn btn-ghost btn-block" onclick="openPromptLibrary()">📚 搜索提示词库</button>
       </div>
     </section>
 
@@ -145,6 +161,7 @@
         <button class="seg-item" data-k="scenes" onclick="setAssetTab('scenes')">场景</button>
         <button class="seg-item" data-k="props" onclick="setAssetTab('props')">道具</button>
       </div>
+      <button class="btn btn-ghost btn-block" style="margin:8px 0 4px;" onclick="if(confirm('将按当前画风圣经重写全部角色/场景/道具的设定图提示词（手改细节尽量保留），继续吗？'))syncAssetsToStyle()">🔄 按当前画风重写全部设定图提示词</button>
       <div id="asset-grid" class="asset-grid"></div>
     </section>
 
@@ -155,6 +172,22 @@
         <div class="toolbar-hint">长按镜头卡片或按住左侧 ⠿ 上下拖动排序（画幅方向在「设置」页调整）</div>
       </div>
       <div id="board-list"></div>
+    </section>
+
+    <!-- 配音 -->
+    <section class="tab-page hidden" id="tab-voice">
+      <div class="card pad voice-card">
+        <div class="sec-title">配音服务 <span class="sec-hint voice-status-hint">探测中…</span></div>
+        <button class="btn btn-ghost btn-block" onclick="openVoiceHelp()">🔊 服务说明 / 启动方法</button>
+      </div>
+      <div class="card pad">
+        <div class="sec-title">角色音色 <span class="sec-hint">⚙️ 进角色设定上传 5-20 秒人声 + 参考文本</span></div>
+        <div id="voice-char-list"></div>
+      </div>
+      <div class="card pad">
+        <div class="sec-title">分镜台词配音 <span class="sec-hint">点「🔊 配音」选音色生成，云端 CPU 每句约 1-3 分钟</span></div>
+        <div id="voice-board-list"></div>
+      </div>
     </section>
 
     <!-- 设置 -->
@@ -200,6 +233,10 @@
       <svg viewBox="0 0 24 24"><path d="M4 5.5A2.5 2.5 0 0 1 6.5 3H19v15.5H6.5A2.5 2.5 0 0 0 4 21V5.5z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><path d="M19 18.5H6.5A2.5 2.5 0 0 0 4 21" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M8 8h7M8 11.5h5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
       <span>故事</span>
     </button>
+    <button class="tabbar-item" data-tab="styles" onclick="setTab('styles')">
+      <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="1.8"/><circle cx="8.6" cy="9.2" r="1.35" fill="currentColor"/><circle cx="14.2" cy="7.6" r="1.35" fill="currentColor"/><circle cx="16.4" cy="12.4" r="1.35" fill="currentColor"/><path d="M12 21c-2.2 0-3.4-1.6-3.4-3 0-1.2.9-2 2.1-2h2.6c1.2 0 2.1.8 2.1 2 0 1.4-1.2 3-3.4 3z" fill="currentColor" opacity=".55"/></svg>
+      <span>风格库</span>
+    </button>
     <button class="tabbar-item" data-tab="assets" onclick="setTab('assets')">
       <svg viewBox="0 0 24 24"><circle cx="9" cy="8.5" r="3.2" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M3.5 19c.6-3 2.8-4.8 5.5-4.8s4.9 1.8 5.5 4.8" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><path d="M15.5 5.6a3.2 3.2 0 0 1 0 5.8M17.5 14.5c1.6.8 2.7 2.3 3 4.5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
       <span>角色场景</span>
@@ -207,6 +244,10 @@
     <button class="tabbar-item" data-tab="boards" onclick="setTab('boards')">
       <svg viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="14" rx="2.5" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M3 9h18M9 5v4M15 5v4M9 19v-6M15 19v-6M3 15h18" stroke="currentColor" stroke-width="1.4" opacity=".55"/></svg>
       <span>分镜</span>
+    </button>
+    <button class="tabbar-item" data-tab="voice" onclick="setTab('voice')">
+      <svg viewBox="0 0 24 24"><rect x="9" y="3" width="6" height="11" rx="3" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M5.5 11.5a6.5 6.5 0 0 0 13 0M12 18v3" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+      <span>配音</span>
     </button>
     <button class="tabbar-item" data-tab="settings" onclick="setTab('settings')">
       <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3.2" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M12 2.8v3M12 18.2v3M2.8 12h3M18.2 12h3M5.5 5.5l2.1 2.1M16.4 16.4l2.1 2.1M18.5 5.5l-2.1 2.1M7.6 16.4l-2.1 2.1" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
@@ -249,7 +290,8 @@
 
 <div id="toast" class="toast hidden"></div>
 <input id="ref-file-input" type="file" accept="image/*" multiple hidden onchange="onRefImages(this)">
+<input id="voice-file-input" type="file" accept="audio/*" hidden onchange="onVoiceAudio(this)">
 
-<script src="/static/app.js?v=35"></script>
+<script src="/static/app.js?v=57"></script>
 </body>
 </html>

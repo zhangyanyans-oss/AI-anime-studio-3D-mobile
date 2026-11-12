@@ -26,6 +26,9 @@ const S = {
   pollBusy: {},       // boardId -> true 表示该分镜的 pollOnce 正在异步执行中（防重入）
   chatImages: [],     // 头脑风暴待发送图片（dataURL）
   refTarget: null,    // 参考图上传目标 {kind, index}
+  voiceTarget: null,  // 音色参考音频上传目标 {kind, index}
+  voiceReady: null,   // 配音服务状态：null=未探测 true=在线 false=不可用
+  voiceWarming: false, // 模型预热中（在线版首次部署下载模型期间）
 };
 
 /* ================= 网络层 ================= */
@@ -219,6 +222,9 @@ function normalizeData(d) {
     if (!Array.isArray(b.videos)) b.videos = [];
     b.videos = [...new Set(b.videos.filter((u) => typeof u === "string" && u))]; // 过滤脏值并去重（历史上轮询竞态产生过重复条目）
     if (b.videoUrl && !b.videos.includes(b.videoUrl)) b.videos.push(b.videoUrl);
+    // 配音列表：[{url, voice}]，老数据无此字段自愈为空数组，脏值过滤
+    if (!Array.isArray(b.dubs)) b.dubs = [];
+    b.dubs = b.dubs.filter((x) => x && typeof x === "object" && typeof x.url === "string" && x.url);
     b.topView = cleanStr(b.topView);
     b.trajView = cleanStr(b.trajView);
     b.videoSubmitting = false; // 运行时标志：数据是刚从库里读出来的，旧的提交请求已不存在
@@ -292,7 +298,7 @@ document.addEventListener("visibilitychange", () => {
 
 /* ================= 底部 Tab ================= */
 const TAB_RENDER = {
-  story: renderStory, assets: renderAssets, boards: renderBoards, settings: renderSettings,
+  story: renderStory, styles: renderStyles, assets: renderAssets, boards: renderBoards, voice: renderVoice, settings: renderSettings,
 };
 function setTab(t) {
   S.tab = t;
@@ -304,12 +310,282 @@ function setTab(t) {
   TAB_RENDER[t] && TAB_RENDER[t]();
 }
 
+/* ================= 风格库页 ================= */
+// 37 张风格选择卡（移植自 AI-anime-studio 桌面版，含预览图）
+const STYLE_GALLERY = [
+  { cat: "3D", name: "无风格（直出）", emoji: "🚫", img: "style-previews/neutral.jpg", desc: "不施加风格倾向，按提示词原始描述直接生成" },
+  { cat: "3D", name: "3D卡通渲染", emoji: "🧸", img: "style-previews/3d_cartoon.jpg", desc: "皮克斯式3D卡通渲染，圆润造型，柔和的次表面散射，明亮饱和的色块" },
+  { cat: "3D", name: "电影级3D质感", emoji: "🎬", img: "style-previews/cinematic_3d.jpg", desc: "写实电影级3D渲染，物理光照，浅景深，电影感构图" },
+  { cat: "3D", name: "国风3D动画", emoji: "🏮", img: "style-previews/guofeng_3d.jpg", desc: "国产3D古风动画质感，敦煌配色，飘逸绸缎与仙侠气韵" },
+  { cat: "3D", name: "黏土定格", emoji: "🧱", img: "style-previews/clay.jpg", desc: "黏土定格动画质感，保留手工捏痕，微缩摄影棚布光" },
+  { cat: "3D", name: "3D厚涂插画", emoji: "🖌️", img: "style-previews/3d_thickpaint.jpg", desc: "3D厚涂质感，立体光影与手绘笔触结合，画面厚重" },
+  { cat: "3D", name: "毛毡布艺", emoji: "🧶", img: "style-previews/felt.jpg", desc: "羊毛毡质感，纤维细节可见，柔和的手工温度" },
+  { cat: "动漫", name: "日式赛璐璐", emoji: "📺", img: "style-previews/cel_anime.jpg", desc: "经典赛璐璐平涂，清晰线稿，色块分明的二分光影" },
+  { cat: "动漫", name: "吉卜力手绘", emoji: "🌿", img: "style-previews/ghibli.jpg", desc: "吉卜力式水彩背景，温暖自然光，细腻的空气感与生活气息" },
+  { cat: "动漫", name: "新海诚光影", emoji: "🌇", img: "style-previews/shinkai.jpg", desc: "新海诚式绚烂天空，超饱和晚霞与逆光，都市青春物语" },
+  { cat: "动漫", name: "90年代复古日漫", emoji: "📼", img: "style-previews/retro_anime.jpg", desc: "90年代赛璐璐质感，胶片颗粒，复古高饱和配色" },
+  { cat: "动漫", name: "二次元厚涂", emoji: "⚔️", img: "style-previews/thick_anime.jpg", desc: "二次元厚涂插画，精致五官刻画，丰富的色彩层次" },
+  { cat: "动漫", name: "美式漫画", emoji: "💥", img: "style-previews/us_comic.jpg", desc: "美式漫画风，粗黑描边，网点阴影，强烈的动感构图" },
+  { cat: "动漫", name: "少女漫画", emoji: "🌸", img: "style-previews/shoujo.jpg", desc: "少女漫画，柔和粉彩，网点与花瓣装饰，唯美氛围" },
+  { cat: "动漫", name: "暗黑日漫", emoji: "🌑", img: "style-previews/dark_anime.jpg", desc: "暗黑系日漫，强对比阴影，哥特式氛围" },
+  { cat: "国风", name: "水墨写意", emoji: "🖤", img: "style-previews/ink_wash.jpg", desc: "水墨晕染，大量留白，毛笔笔触，意境深远" },
+  { cat: "国风", name: "青绿山水", emoji: "⛰️", img: "style-previews/blue_green.jpg", desc: "千里江山图式青绿设色，绢本底色，古典山水构图" },
+  { cat: "国风", name: "工笔重彩", emoji: "🪭", img: "style-previews/gongbi.jpg", desc: "工笔重彩，匀细游丝描，矿物颜料质感" },
+  { cat: "国风", name: "敦煌壁画", emoji: "🕌", img: "style-previews/dunhuang.jpg", desc: "敦煌壁画质感，斑驳墙面，飞天线描，土黄与石绿" },
+  { cat: "国风", name: "剪纸皮影", emoji: "🎭", img: "style-previews/papercut.jpg", desc: "剪纸皮影风格，平面镂空，红黑对比，民间艺术质感" },
+  { cat: "国风", name: "青花瓷韵", emoji: "🏺", img: "style-previews/bluewhite.jpg", desc: "青花瓷配色，缠枝纹样，白底蓝彩的东方雅致" },
+  { cat: "影视", name: "电影胶片", emoji: "🎞️", img: "style-previews/film35.jpg", desc: "35mm胶片颗粒，宽画幅，柯达暖调，电影级调色" },
+  { cat: "影视", name: "赛博朋克", emoji: "🌃", img: "style-previews/cyberpunk.jpg", desc: "赛博朋克，霓虹雨夜，全息广告，青紫高对比" },
+  { cat: "影视", name: "末日废土", emoji: "☢️", img: "style-previews/wasteland.jpg", desc: "废土美学，沙尘色温，残破建筑与锈蚀金属" },
+  { cat: "影视", name: "黑色电影", emoji: "🕶️", img: "style-previews/noir.jpg", desc: "Film Noir，高对比黑白，百叶窗光影，悬疑氛围" },
+  { cat: "影视", name: "冰雪末世", emoji: "❄️", img: "style-previews/ice.jpg", desc: "冰雪末世，冷蓝低饱和，雾气与冰晶颗粒" },
+  { cat: "影视", name: "蒸汽波", emoji: "🌴", img: "style-previews/vaporwave.jpg", desc: "蒸汽波美学，粉紫渐变，复古电脑图形与雕像元素" },
+  { cat: "影视", name: "暗黑恐怖", emoji: "🕯️", img: "style-previews/horror.jpg", desc: "暗黑恐怖，单光源烛光，浓重阴影，低明度" },
+  { cat: "影视", name: "温暖生活剧", emoji: "🏠", img: "style-previews/family_warm.jpg", desc: "温暖生活剧质感，柔光，暖黄室内色调" },
+  { cat: "艺术", name: "梵高油画", emoji: "🌻", img: "style-previews/vangogh.jpg", desc: "梵高式厚涂油画，流动的短笔触，浓烈奔放的色彩" },
+  { cat: "艺术", name: "水彩绘本", emoji: "🖍️", img: "style-previews/watercolor_kids.jpg", desc: "儿童绘本水彩，柔和边缘，纸张纹理，天真视角" },
+  { cat: "艺术", name: "扁平插画", emoji: "🔷", img: "style-previews/flat.jpg", desc: "扁平矢量插画，几何色块，无描边，现代简洁" },
+  { cat: "艺术", name: "像素艺术", emoji: "👾", img: "style-previews/pixel.jpg", desc: "像素艺术，有限调色板，16-bit复古游戏感" },
+  { cat: "艺术", name: "浮世绘", emoji: "🌊", img: "style-previews/ukiyo.jpg", desc: "浮世绘木刻，平涂色块，波浪与云纹图式" },
+  { cat: "艺术", name: "极简线条", emoji: "✏️", img: "style-previews/line_min.jpg", desc: "极简单线插画，大量留白，一根线条讲完故事" },
+  { cat: "艺术", name: "暗黑哥特", emoji: "🦇", img: "style-previews/gothic.jpg", desc: "哥特式暗黑华丽，尖拱与蕾丝，抑郁而优雅" },
+  { cat: "艺术", name: "复古印刷", emoji: "📰", img: "style-previews/retro_print.jpg", desc: "复古印刷海报，错版套色，粗糙纸纹" },
+];
+let styleGalleryCat = "全部";
+
+function renderStyles() {
+  // 分类筛选条
+  const cats = ["全部", ...new Set(STYLE_GALLERY.map((p) => p.cat))];
+  const seg = $("style-cat-seg");
+  if (seg && !seg.dataset.built) {
+    seg.innerHTML = cats.map((c) => `<button class="seg-item" data-k="${esc(c)}" onclick="setStyleGalleryCat('${esc(c)}')">${esc(c)}</button>`).join("");
+    seg.dataset.built = "1";
+  }
+  renderStyleGallery();
+  // oip 进阶参考区收起态；提示词库入口探测
+  const list = $("styles-list");
+  if (list && !list.classList.contains("hidden") && !S.stylesLoaded) loadOipCards();
+  promptLibProbe();
+}
+function setStyleGalleryCat(c) {
+  styleGalleryCat = c;
+  renderStyleGallery();
+}
+function renderStyleGallery() {
+  const grid = $("style-gallery");
+  if (!grid) return;
+  const seg = $("style-cat-seg");
+  if (seg) seg.querySelectorAll(".seg-item").forEach((el) => el.classList.toggle("active", el.dataset.k === styleGalleryCat));
+  const items = STYLE_GALLERY.filter((p) => styleGalleryCat === "全部" || p.cat === styleGalleryCat);
+  grid.innerHTML = items.map((p) => `
+    <div class="style-card">
+      <div class="style-thumb" style="background:${esc(p.img ? "" : "#2a2d3a")}">
+        ${p.img ? `<img src="/static/${esc(p.img)}" loading="lazy" alt="${esc(p.name)}" onerror="this.remove()">` : ""}
+        <span class="style-emoji">${esc(p.emoji)}</span>
+      </div>
+      <div class="style-info">
+        <b>${esc(p.name)}</b>
+        <p>${esc(p.desc)}</p>
+      </div>
+      <div class="style-actions">
+        <button class="btn btn-primary style-btn" onclick="applyStyleBible('${esc(p.name)}')">✍️ 用这套</button>
+        <button class="btn btn-ghost style-btn" onclick="copyStyleDesc('${esc(p.name)}')">📋 复制</button>
+      </div>
+    </div>`).join("");
+}
+function findStylePreset(name) {
+  return STYLE_GALLERY.find((x) => x.name === name);
+}
+function applyStyleBible(name) {
+  const p = findStylePreset(name);
+  if (!p) return;
+  const desc = p.name === "无风格（直出）" ? "" : p.desc;
+  const d = S.cur?.data;
+  if (!d) {
+    // 连项目都没打开（理论上 tab 只在项目内出现）：退回复制
+    copyStyleDesc(name);
+    return toast("还没有打开项目，已复制描述");
+  }
+  if (d.story) {
+    // 已有剧本：直接写入画风圣经并跳回故事页看效果
+    d.story.style_bible = desc;
+    delete d.pending_style;
+    touch();
+    setTab("story");
+    toast(desc ? `已把「${p.name}」写入画风圣经` : "已清空风格倾向（直出）");
+    // 换风格后资产提示词（人物/场景/道具）仍是旧画风 —— 询问是否立即重写
+    const kinds = ["characters", "scenes", "props"];
+    const total = kinds.reduce((n, k) => n + ((d.story[k] || []).length), 0);
+    if (desc && total) {
+      setTimeout(() => {
+        if (confirm(`检测到 ${total} 个角色/场景/道具的设定图提示词还是旧画风。\n\n是否立即按新画风重写？\n（已生成的参考图不会自动重绘，重写后重新生图即可换装新风格；你手改过的外观细节会尽量保留）`)) {
+          syncAssetsToStyle(desc);
+        }
+      }, 600);
+    }
+  } else {
+    // 还没有剧本：暂存，生成剧本时自动套用
+    d.pending_style = { name: p.name, desc };
+    touch();
+    setTab("story");
+    toast(desc ? `已暂存「${p.name}」，生成剧本后自动套用` : "已暂存直出模式，生成剧本后生效");
+  }
+}
+function clearPendingStyle() {
+  const d = S.cur?.data;
+  if (!d || !d.pending_style) return;
+  delete d.pending_style;
+  touch();
+  renderStory();
+}
+async function copyStyleDesc(name) {
+  const p = findStylePreset(name);
+  if (!p) return;
+  const done = () => toast("已复制，可粘贴进画风圣经或分镜提示词");
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(p.desc).then(done, () => fallbackCopyText(p.desc, done));
+  } else {
+    fallbackCopyText(p.desc, done);
+  }
+}
+/* ---- oip 39 张要点卡：折叠区，按需加载 ---- */
+function toggleOipCards() {
+  const list = $("styles-list");
+  const btn = $("oip-toggle-btn");
+  if (!list || !btn) return;
+  const opening = list.classList.contains("hidden");
+  list.classList.toggle("hidden", !opening);
+  btn.textContent = opening ? "收起 ▴" : "展开 ▾";
+  if (opening && !S.stylesLoaded) loadOipCards();
+}
+async function loadOipCards() {
+  const list = $("styles-list");
+  if (!list) return;
+  list.innerHTML = `<p class="lib-empty">加载中…</p>`;
+  try {
+    const r = await api("/api/style-cards", undefined, "GET", 15000);
+    const cards = r.cards || [];
+    if (!$("styles-list")) return;
+    if (!cards.length) {
+      list.innerHTML = `<p class="lib-empty">没有可用的风格卡</p>`;
+    } else {
+      list.innerHTML = cards.map((c) => `
+        <div class="sc-item" onclick="toggleStyleCard('${esc(c.id)}')">
+          <div class="sc-head"><b>${esc(c.title)}</b><span class="sc-id">${esc(c.id)}</span></div>
+          <p class="sc-summary">${esc(c.summary)}</p>
+          <div class="sc-detail hidden" id="sc-detail-${esc(c.id)}"></div>
+        </div>`).join("");
+    }
+    S.stylesLoaded = true;
+  } catch (e) {
+    if ($("styles-list")) list.innerHTML = `<p class="lib-empty">加载失败：${esc(e.message)}（点「收起」再「展开」重试）</p>`;
+  }
+}
+
+/* ================= 配音页：服务状态 + 角色音色 + 分镜台词配音 ================= */
+async function voiceStatusProbe() {
+  try {
+    const r = await api("/api/voice/status", undefined, "GET", 8000);
+    S.voiceReady = !!r.ready;
+    S.voiceWarming = !r.ready && !!r.warming;
+  } catch (e) {
+    S.voiceReady = false;
+    S.voiceWarming = false;
+    console.log("[配音] 状态探测失败：", e.message);
+  }
+  // 状态卡在「配音」页和「设置」页各有一份，用 class 统一更新
+  document.querySelectorAll(".voice-status-hint").forEach((el) => {
+    el.textContent = S.voiceReady ? "已就绪 · VoxCPM 声音克隆（CPU 推理）"
+      : S.voiceWarming ? "模型预热中（首次需下载约 1GB），请稍后重试"
+      : "未启动 · 配音功能不可用";
+  });
+  document.querySelectorAll(".voice-card").forEach((card) => card.classList.toggle("voice-off", !S.voiceReady));
+  // 预设音色列表（配音抽屉下拉框用），静默拉取一次
+  if (!S.voicePresets) {
+    try {
+      const pr = await api("/api/voice/presets", undefined, "GET", 8000);
+      S.voicePresets = pr.presets || [];
+    } catch (e) {
+      S.voicePresets = [];
+    }
+  }
+  return S.voiceReady;
+}
+function renderVoice() {
+  renderVoiceCharList();
+  renderVoiceBoardList();
+  if (S.voiceReady === null) {
+    voiceStatusProbe().then(() => { renderVoiceCharList(); renderVoiceBoardList(); });
+  }
+}
+function renderVoiceCharList() {
+  const box = $("voice-char-list");
+  if (!box) return;
+  const chars = ((S.cur?.data.story || {}).characters) || [];
+  if (!chars.length) {
+    box.innerHTML = `<p class="lib-empty">还没有角色：先在「故事」页生成剧本</p>`;
+    return;
+  }
+  box.innerHTML = chars.map((c, i) => `
+    <div class="vrow">
+      <div class="vrow-main">
+        <b class="vrow-name">${esc(c.name)}</b>
+        ${c.voice_url
+          ? `<audio controls preload="metadata" src="${c.voice_url}"></audio>
+          <button class="btn btn-ghost btn-act-sm" title="下载参考音频" onclick="downloadVoice(${i})">⬇</button>`
+          : `<span class="vrow-miss">未设定音色</span>`}
+      </div>
+      <button class="btn btn-ghost btn-act-sm" title="设定音色 / 参考文本" onclick="openAssetSheet('characters',${i})">⚙️</button>
+    </div>`).join("");
+}
+function renderVoiceBoardList() {
+  const box = $("voice-board-list");
+  if (!box) return;
+  const boards = S.cur?.data.boards || [];
+  if (!boards.length) {
+    box.innerHTML = `<p class="lib-empty">还没有分镜：先在「故事」页生成剧本</p>`;
+    return;
+  }
+  if (S.voiceReady === false) {
+    box.innerHTML = S.voiceWarming
+      ? `<p class="lib-empty">⏳ 模型预热中：首次部署会自动下载约 1GB 模型（几分钟），完成后即可配音</p>
+      <button class="btn btn-ghost btn-block" onclick="S.voiceReady = null; renderVoice()">🔄 重新探测</button>`
+      : `<p class="lib-empty">配音服务不可用：在线版请稍后重试；本地版点上方「服务说明 / 启动方法」查看如何启动</p>
+      <button class="btn btn-ghost btn-block" onclick="S.voiceReady = null; renderVoice()">🔄 重新探测</button>`;
+    return;
+  }
+  box.innerHTML = boards.map((b) => {
+    const dubs = b.dubs || [];
+    const latest = dubs[dubs.length - 1];
+    return `
+    <div class="vrow">
+      <div class="vrow-main">
+        <span class="vrow-no">${b.shot_number}</span>
+        <div class="vrow-text">
+          <div class="vrow-line">${b.dialogue ? esc(b.dialogue) : `<i style="color:var(--muted);font-size:12.5px;">无台词（点配音后在抽屉里填写）</i>`}</div>
+          ${latest ? `<audio controls preload="metadata" src="${latest.url}"></audio>
+          <span class="vrow-miss">最新：${esc(latest.voice || "随机音色")}${dubs.length > 1 ? ` · 共 ${dubs.length} 条` : ""}</span>` : ""}
+        </div>
+      </div>
+      ${latest ? `<button class="btn btn-ghost" title="下载最新配音" onclick="downloadDub('${b.id}',${dubs.length - 1})">⬇</button>` : ""}
+      <button class="btn btn-ghost" onclick="openDubSheet('${b.id}')">🔊 配音</button>
+    </div>`;
+  }).join("");
+}
+
 /* ================= 故事页 ================= */
 function renderStory() {
   const d = S.cur.data;
   const hasStory = !!d.story;
   $("story-create").classList.toggle("hidden", hasStory);
   $("story-view").classList.toggle("hidden", !hasStory);
+  // 预选风格提示条（还没有剧本时显示）
+  const ps = $("pending-style");
+  if (ps) {
+    const show = !hasStory && d.pending_style;
+    ps.classList.toggle("hidden", !show);
+    if (show) ps.innerHTML = `🎨 已选风格：<b>${esc(d.pending_style.name)}</b>，生成剧本后自动套用 <button class="mini-edit" onclick="clearPendingStyle()">✕ 取消</button>`;
+  }
   // 生成剧本后不再隐藏头脑风暴：可通过「💬 头脑风暴对话」按钮展开继续聊
   const showChat = !!(d.draft && d.draft.messages.length) && (S.showBrainstorm || !hasStory);
   $("brainstorm-wrap").classList.toggle("hidden", !showChat);
@@ -353,7 +629,7 @@ async function genStoryFromIdea() {
   if (!idea) return toast("先写点什么吧", true);
   showBusy("正在创作剧本…", "生成角色、场景、分镜与全部提示词，约 1–2 分钟");
   try {
-    const story = await api("/api/generate-story", { idea });
+    const story = await api("/api/generate-story", { idea, style_bible: S.cur?.data?.pending_style ? S.cur.data.pending_style.desc : undefined });
     S.showBrainstorm = false;
     applyStory(story);
     hideBusy();
@@ -378,6 +654,11 @@ function applyStory(story) {
     }
   }
   delete d.story_assets;
+  // 用户在风格库预选的风格：覆盖 AI 自拟画风，保证剧本/分镜与所选风格一致
+  if (d.pending_style) {
+    story.style_bible = d.pending_style.desc;
+    delete d.pending_style;
+  }
   d.story = story;
   d.boards = (story.storyboards || []).map((sb, i) => ({
     id: "b" + (sb.shot_number || i + 1) + "_" + Math.random().toString(36).slice(2, 7),
@@ -406,6 +687,7 @@ async function genStoryFromChat() {
     const story = await api("/api/generate-story", {
       idea: "根据头脑风暴对话生成",
       chat_history: (d.draft.messages || []).map((m) => ({ role: m.role, content: m.content })),
+      style_bible: d.pending_style ? d.pending_style.desc : undefined,
     });
     S.showBrainstorm = false;
     applyStory(story);
@@ -473,14 +755,57 @@ async function syncBoardsToStory() {
         old_prompt: b.image_prompt || "",
         feedback: "按最新剧情梗概与画风圣经整体校准本镜头：剧情走向与人物行为符合新梗概；美术风格/光源/影调/氛围严格按新画风圣经重写；保留本镜头原有的叙事作用、景别与构图要点。",
       });
-      if (r.image_prompt) { b.image_prompt = r.image_prompt; ok++; }
-      if (r.video_prompt) b.video_prompt = r.video_prompt;
+      const oldImg = b.image_prompt || "", oldVid = b.video_prompt || "";
+      if (r.image_prompt) { b.image_prompt = keepParams(r.image_prompt, oldImg); ok++; }
+      if (r.video_prompt) b.video_prompt = keepParams(r.video_prompt, oldVid);
       touch();
     } catch (e) { fail++; }
   }
   hideBusy();
   toast(fail ? `更新完成：成功 ${ok} 个，失败 ${fail} 个（稍后可再点一次重试失败的）`
              : `✅ ${ok} 个分镜提示词已更新；已生成的图片不变，逐镜重新生成即可看到新梗概/新画风`);
+}
+
+/* ---------- 换画风后重写资产（角色/场景/道具）设定图提示词 ---------- */
+async function syncAssetsToStyle(styleDesc) {
+  const d = S.cur?.data;
+  if (!d?.story) return;
+  if (!styleDesc) styleDesc = d.story.style_bible || "";
+  const KINDS = [
+    ["characters", "character", "角色"],
+    ["scenes", "scene", "场景"],
+    ["props", "prop", "道具"],
+  ];
+  const items = [];
+  for (const [key, type, label] of KINDS) {
+    for (const it of d.story[key] || []) {
+      if (it && it.name) items.push({ kind: key, type, label, it });
+    }
+  }
+  if (!items.length) return toast("还没有角色/场景/道具可重写", true);
+  let ok = 0, fail = 0;
+  showBusy("正在按新画风重写设定图提示词…", `0/${items.length}`);
+  for (let i = 0; i < items.length; i++) {
+    const { type, label, it } = items[i];
+    $("busy-sub").textContent = `${i + 1}/${items.length} · ${esc(it.name)} · ${fail ? "失败 " + fail + " 个" : "约每个几秒"}`;
+    try {
+      const r = await api("/api/regenerate-prompt", {
+        type,
+        style_bible: styleDesc,
+        synopsis: d.story.synopsis || "",
+        name: it.name,
+        description: it.description || "",
+        old_prompt: it.image_prompt || "",
+        feedback: "全片画风已更换：把本设定图提示词按新画风圣经重写，美术风格/色调/光影/画质描述必须符合新风格；保留名称、身份设定与原有外观锚点（发型发色/瞳色/五官/体型年龄/服装款式与颜色/随身标志物/陈设/材质），不要新增或删除关键特征。",
+      });
+      if (r.image_prompt) { it.image_prompt = keepParams(r.image_prompt, it.image_prompt || ""); ok++; }
+      touch();
+    } catch (e) { fail++; }
+  }
+  hideBusy();
+  renderAssets?.();
+  toast(fail ? `重写完成：成功 ${ok} 个，失败 ${fail} 个（可再试一次）`
+             : `✅ ${ok} 个设定图提示词已换新画风；已生成的参考图不变，重新生图即可看到新风格`);
 }
 
 /* ---------- 头脑风暴 ---------- */
@@ -599,6 +924,17 @@ function openAssetSheet(kind, index) {
         <button class="img-del" style="width:20px;height:20px;font-size:10px;" onclick="delRef('${kind}',${index},${j})">✕</button></div>`).join("")}
       <button class="ref-add-btn" onclick="addRef('${kind}',${index})">＋<span>上传</span></button>
     </div>
+    ${isChar ? `
+    <label class="field-label">音色参考（声音克隆素材，5-20 秒清晰人声）</label>
+    <div class="sheet-preview-row" id="voice-row">
+      ${it.voice_url ? `<div class="voice-ref-item"><audio controls preload="metadata" src="${it.voice_url}"></audio>
+        <button class="img-del" style="width:20px;height:20px;font-size:10px;" onclick="delVoice('${kind}',${index})">✕</button></div>` : ""}
+      <button class="ref-add-btn" onclick="addVoiceRef('${kind}',${index})">＋<span>上传音频</span></button>
+    </div>
+    ${it.voice_url ? `
+    <label class="field-label">音色参考文本（上面音频里实际念的那句话，必须逐字对应）</label>
+    <textarea id="as-voice-text" rows="2" placeholder="照抄上面音频里说的话，例：大家好，欢迎收看今天的节目。">${esc(it.voice_text || "")}</textarea>
+    <p class="lib-empty" style="text-align:left;margin-top:2px;font-size:12px;">不是你要合成的台词 —— 它只是帮模型认出这段音频的音色。填错会导致克隆失败（变成随机音色 + 破音）。</p>` : ""}` : ""}
     <label class="field-label">名称</label>
     <input id="as-name" value="${esc(it.name)}">
     <label class="field-label">设定描述</label>
@@ -620,6 +956,8 @@ function saveAsset(kind, index) {
   it.name = $("as-name").value.trim() || it.name;
   it.description = $("as-desc").value.trim();
   it.image_prompt = $("as-prompt").value.trim();
+  const vt = $("as-voice-text");
+  if (vt) it.voice_text = vt.value.trim();
   touch();
   renderAssets();
   closeSheet();
@@ -664,16 +1002,20 @@ async function aiRewrite(kind, index) {
   const it = st[kind]?.[index];
   if (!it) return;
   const feedback = ($("as-feedback").value || "").trim();
+  // 修改框当前内容优先：用户改完没点「保存」直接点 AI 重写，也必须按框里最新内容重写
+  const desc = (($("as-desc")?.value ?? it.description) || "").trim();
+  const oldPrompt = (($("as-prompt")?.value ?? it.image_prompt) || "").trim();
   showBusy("AI 正在重写提示词…", "结合画风圣经与角色锚点");
   try {
     const r = await api("/api/regenerate-prompt", {
       type: kind === "characters" ? "character" : kind === "scenes" ? "scene" : "prop",
-      name: it.name, description: it.description,
+      name: it.name, description: desc,
       style_bible: st.style_bible || "",
       characters: (st.characters || []).map((c) => ({ name: c.name, image_prompt: c.image_prompt })),
-      old_prompt: it.image_prompt, feedback: feedback || undefined,
+      old_prompt: oldPrompt, feedback: feedback || undefined,
     });
-    it.image_prompt = r.image_prompt || it.image_prompt;
+    it.description = desc;            // 框内描述一并写回，避免保存后又改回去
+    it.image_prompt = keepParams(r.image_prompt || oldPrompt || it.image_prompt, oldPrompt);
     hideBusy(); touch(); openAssetSheet(kind, index);
     toast("提示词已重写，可检查后生成");
   } catch (e) { hideBusy(); toast(e.message, true); }
@@ -707,6 +1049,41 @@ function delRef(kind, index, j) {
   if (!it) return;
   it.ref_images.splice(j, 1);
   touch(); openAssetSheet(kind, index);
+}
+/* ---------- 角色音色参考：上传 / 删除（声音克隆素材，随引用清理） ---------- */
+function addVoiceRef(kind, index) { S.voiceTarget = { kind, index }; $("voice-file-input").click(); }
+async function onVoiceAudio(input) {
+  const t = S.voiceTarget;
+  S.voiceTarget = null;
+  const file = (input.files || [])[0];
+  input.value = "";
+  if (!t || !file) return;
+  const it = (S.cur.data.story || {})[t.kind]?.[t.index];
+  if (!it) return;
+  const dataUrl = await new Promise((res) => {
+    const r = new FileReader(); r.onload = () => res(r.result); r.readAsDataURL(file);
+  });
+  showBusy("上传音色参考…");
+  const old = it.voice_url;
+  try {
+    const r = await api("/api/upload-voice", { audio_base64: dataUrl, filename: file.name });
+    it.voice_url = r.voice_url;
+    touch();
+    if (old && old !== r.voice_url) purgeServerFiles([old]);
+    toast("音色已上传，记得填写「音色参考文本」");
+  } catch (e) { toast(e.message, true); }
+  hideBusy();
+  openAssetSheet(t.kind, t.index);
+}
+function delVoice(kind, index) {
+  const it = (S.cur.data.story || {})[kind]?.[index];
+  if (!it) return;
+  const old = it.voice_url;
+  it.voice_url = null;
+  it.voice_text = "";
+  touch();
+  if (old) purgeServerFiles([old]);
+  openAssetSheet(kind, index);
 }
 function delAssetImage(kind, index) {
   const it = (S.cur.data.story || {})[kind]?.[index];
@@ -800,8 +1177,20 @@ function renderBoards() {
         生成失败，请重试${b.videoError ? `<div style="font-size:12px;margin-top:6px;opacity:.85;">原因：${esc(b.videoError)}</div>` : ""}
       </div>` : "";
     const videoPart = (videoStrip || videoState) ? `<div class="board-video">${videoStrip}${videoState}</div>` : "";
+    // 配音条：已生成的配音（音色名 + 播放器 + 删除），紧挨视频区
+    const dubStrip = (b.dubs && b.dubs.length) ? `<div class="board-dubs">
+      ${b.dubs.map((d, di) => `
+      <div class="dub-item">
+        <span class="dub-tag">🔊 ${esc(d.voice || "随机音色")}</span>
+        <audio controls preload="metadata" src="${d.url}" onerror="delDubAudio('${b.id}',${di})"></audio>
+        <button class="vbtn" title="下载此配音" onclick="downloadDub('${b.id}',${di})">⬇</button>
+        <button class="vbtn" title="删除此配音" onclick="delDub('${b.id}',${di})">🗑</button>
+      </div>`).join("")}
+    </div>` : "";
     const hasDiag = !!(b.topView || b.trajView);
     const canVideo = b.images.length > 0 && b.videoStatus !== "running";
+    // 当前运镜（字段优先，老数据从正文解析）——显示在卡片上，点一下进生成弹窗
+    const curMove = (b.shot_params && b.shot_params.video && b.shot_params.video["运镜"]) || readParam(b.video_prompt || "", "运镜");
     return `
     <div class="board-card" data-bid="${b.id}">
       <div class="board-head">
@@ -811,16 +1200,21 @@ function renderBoards() {
           ${b.dialogue ? `<div class="board-dialogue">${esc(b.dialogue)}</div>` : ""}
         </div>
         <div class="dur-chip">${b.duration}s</div>
+        <div class="head-ops">
+          <button class="head-op" onclick="addBoardAfter('${b.id}')" title="在此镜头后插入新分镜">＋</button>
+          <button class="head-op head-op-del board-del" onclick="delBoard('${b.id}')" title="删除此分镜">－</button>
+        </div>
       </div>
       <div class="board-media">${genImg}</div>
       ${videoPart}
+      ${dubStrip}
+      ${curMove ? `<button class="move-chip" onclick="openVideoSheet('${b.id}')" title="点一下重新选运镜生成">🎥 运镜：${esc(curMove)}</button>` : ""}
       <div class="board-actions">
         <button class="btn btn-ghost" onclick="genBoardImage('${b.id}')">🖼 生图</button>
         <button class="btn btn-ghost" onclick="openDiagramSheet('${b.id}')">🗺 调度图${hasDiag ? " ✅" : ""}</button>
         <button class="btn btn-ghost" onclick="openBoardSheet('${b.id}')">✏️ 提示词</button>
-        <button class="btn btn-primary" ${canVideo ? "" : "disabled"} onclick="genBoardVideo('${b.id}')">🎬 视频</button>
-        <button class="btn btn-ghost btn-act-sm" onclick="addBoardAfter('${b.id}')" title="在此镜头后插入新分镜">➕</button>
-        <button class="btn btn-ghost btn-act-sm board-del" onclick="delBoard('${b.id}')" title="删除此分镜">🗑</button>
+        <button class="btn btn-ghost" onclick="openDubSheet('${b.id}')">🔊 配音${b.dubs && b.dubs.length ? " ✅" : ""}</button>
+        <button class="btn btn-primary" ${canVideo ? "" : "disabled"} onclick="openVideoSheet('${b.id}')">🎬 视频</button>
       </div>
     </div>`;
   }).join("");
@@ -855,7 +1249,8 @@ function delBoard(bid) {
   if (!confirm(`确定删除分镜 ${b.shot_number}「${(b.description || "").slice(0, 20)}」吗？\n删除后不可恢复，已生成的图片/视频文件也将从服务器一并删除。`)) return;
   if (b.videoStatus === "running") stopPoll(b.id);
   // 收集该分镜在服务器上的全部文件，删除分镜后一并清理
-  const stale = [...(b.images || []), ...(b.videos || []), b.videoUrl, b.trajView, b.topView].filter(Boolean);
+  const stale = [...(b.images || []), ...(b.videos || []), b.videoUrl, b.trajView, b.topView,
+    ...((b.dubs || []).map((d) => d.url))].filter(Boolean);
   boards.splice(idx, 1);
   renumberBoards();
   touch(); renderBoards();
@@ -1014,12 +1409,148 @@ function delBoardImage(bid, j) {
   touch(); renderBoards();
   purgeServerFiles([removed]); // 服务器文件同步删除（仍被其他项目引用时会自动保留）
 }
+/* ---------- 画面参数下拉：景别 / 景深 / 机位 / 焦段 / 构图 / 光线（+ 运镜） ----------
+   设计：选中的参数以「标签：值」形式写进提示词正文，而不是存独立字段。
+   原因——写进正文后，参数跟着正文一起走，重写时也能被识别并强制保留；存字段反而容易在重写时丢。
+   优先级：手动选定的参数 > AI 生成（见 keepParams）；同组切换只替换不堆叠；打开抽屉时按正文反解析回填下拉。 */
+/* 选项可以是纯字符串，也可以是 {label, value}：
+   label 是下拉里显示的短名，value 是真正写进提示词的文本——带上量化的画面效果，
+   否则「景别：远景」这种单字值对生图模型约束太弱，人像照样画得很大。 */
+const SHOT_PARAMS = [
+  { label: "景别", opts: [
+    { label: "大远景", value: "大远景 extreme wide shot（人物极小 约占画面高度8% 环境占90%以上）" },
+    { label: "远景", value: "远景 wide shot（人物较小 约占画面高度20% 四周大量环境留白）" },
+    { label: "全景", value: "全景 full shot（全身完整入画 头顶脚下留白）" },
+    { label: "中景", value: "中景 medium shot（腰部以上入画）" },
+    { label: "中近景", value: "中近景 medium close-up（胸部以上入画）" },
+    { label: "近景", value: "近景 close shot（肩部以上入画）" },
+    { label: "特写", value: "特写 close-up（面部充满画面）" },
+    { label: "大特写", value: "大特写 extreme close-up（局部充满画面 如眼睛或手）" },
+  ] },
+  { label: "景深", opts: ["超浅景深", "浅景深", "中等景深", "深景深"] },
+  { label: "机位", opts: ["平视", "低角度仰拍", "高角度俯拍", "鸟瞰", "荷兰角", "过肩", "主观视角"] },
+  { label: "焦段", opts: [
+    { label: "14mm 超广角", value: "14mm 超广角（强烈透视 空间拉伸 人物易显小）" },
+    { label: "24mm 广角", value: "24mm 广角（视野开阔 边缘轻微变形）" },
+    { label: "35mm 人文广角", value: "35mm 人文广角（接近人眼 自然不夸张）" },
+    { label: "50mm 标准", value: "50mm 标准（视角平实 无透视变形）" },
+    { label: "85mm 中长焦", value: "85mm 中长焦（压缩空间 背景柔化）" },
+    { label: "135mm 长焦", value: "135mm 长焦（强空间压缩 背景大幅虚化）" },
+  ] },
+  { label: "构图", opts: ["三分法", "中心对称", "对角线", "框架式", "引导线", "前景遮挡", "大量留白"] },
+  { label: "光线", opts: ["顺光", "侧光", "逆光轮廓光", "顶光", "底光", "伦勃朗光", "柔光散射", "硬光直射"] },
+];
+const MOVE_PARAMS = [
+  { label: "运镜", opts: ["固定镜头", "缓缓推近", "缓缓拉远", "横移", "摇镜", "跟随", "环绕", "升降"] },
+];
+const ALL_PARAMS = SHOT_PARAMS.concat(MOVE_PARAMS);
+
+function _paramRe(label) {
+  // 分隔符含「】」，否则「【镜头细节】景别：中景」这种紧贴小节标题的写法识别不到
+  return new RegExp("(^|[，,；;、。\\n】])\\s*" + label + "\\s*[:：][^，,；;、。\\n】]*", "g");
+}
+/** 从提示词正文读出某组已选值（没有则空串） */
+function readParam(text, label) {
+  const m = (text || "").match(new RegExp(label + "\\s*[:：]\\s*([^，,；;、。\\n】]*)"));
+  return m ? (m[1] || "").trim() : "";
+}
+/** 写入/替换/删除某组参数；value 为空 = 删除该组 */
+function setParam(text, label, value) {
+  let t = (text || "").replace(_paramRe(label), "$1");
+  // 删掉一段后清理残留分隔符：连续逗号、行首/行尾孤立的标点
+  t = t.replace(/([，,；;、])\s*[，,；;、]/g, "$1")
+       .replace(/^[，,；;、。\s]+/, "")
+       .replace(/[，,；;、。\s]+$/g, "")
+       .trim();
+  if (value) t = (t ? t + "，" : "") + label + "：" + value;
+  return t;
+}
+/** 选项归一化：支持纯字符串与 {label, value} 两种写法 */
+function optLabel(o) { return typeof o === "string" ? o : o.label; }
+function optValue(o) { return typeof o === "string" ? o : o.value; }
+/** 把正文/字段里的值对齐到某个选项的完整 value（兼容旧数据里只存了「远景」的情况） */
+function matchOptValue(group, v) {
+  if (!v) return "";
+  const opts = group.opts.map(optValue);
+  if (opts.includes(v)) return v;
+  const hit = opts.find((o) => o.startsWith(v + " ") || o.startsWith(v + "（") || o.startsWith(v + "("));
+  return hit || v;   // 对不上就原样保留，别把用户的值吃掉
+}
+function paramGridHtml(taId, groups) {
+  return `<div class="param-grid" id="pg-${taId}">${groups.map((g) => `
+    <label class="param-cell"><span>${g.label}</span>
+      <select onchange="onParamPick('${taId}','${g.label}',this.value)">
+        <option value="">不指定</option>
+        ${g.opts.map((o) => `<option value="${esc(optValue(o))}">${esc(optLabel(o))}</option>`).join("")}
+      </select>
+    </label>`).join("")}</div>`;
+}
+/** 当前抽屉里选中的参数（独立于正文保存，清空提示词框也不会丢） */
+let SHEET_PARAMS = { img: {}, video: {} };
+function parseParams(text, groups) {
+  const out = {};
+  groups.forEach((g) => { const v = readParam(text, g.label); if (v) out[g.label] = v; });
+  return out;
+}
+/** 把参数字典写回正文（缺的补上、已有同组的替换） */
+function applyParams(text, params) {
+  let t = text || "";
+  ALL_PARAMS.forEach((g) => { const v = params && params[g.label]; if (v) t = setParam(t, g.label, v); });
+  return t;
+}
+/** 景别与焦段互相打架时提醒（长焦压缩空间，会把远景的人拉近显大） */
+function checkParamConflict(bag) {
+  const shot = bag["景别"] || "", lens = bag["焦段"] || "";
+  if (!shot || !lens) return;
+  if (shot.includes("远景") && (lens.startsWith("85mm") || lens.startsWith("135mm"))) {
+    toast("长焦会压缩空间、把人物拉近显大；想让人小小一个，建议配 24mm 广角", true);
+  }
+}
+function onParamPick(taId, label, value) {
+  const ta = $(taId);
+  const slot = taId === "bd-vidp" ? "video" : "img";
+  const bag = SHEET_PARAMS[slot] || (SHEET_PARAMS[slot] = {});
+  if (value) bag[label] = value; else delete bag[label];
+  if (ta) ta.value = setParam(ta.value, label, value);
+  if (slot === "img") checkParamConflict(bag);
+}
+/** 打开抽屉后：把已选参数回填到下拉 */
+function syncParamGrid(taId, groups, params) {
+  const grid = $("pg-" + taId);
+  if (!grid) return;
+  const sels = grid.querySelectorAll("select");
+  groups.forEach((g, i) => {
+    if (!sels[i]) return;
+    const v = (params && params[g.label]) || "";
+    sels[i].value = v ? matchOptValue(g, v) : "";
+    // 旧数据只存了「远景」这类短值、对不上新选项时，顺手把完整值补进字段
+    if (v && sels[i].value && sels[i].value !== v && params) params[g.label] = sels[i].value;
+  });
+}
+/** AI 重写后：你手动选定的参数一律覆盖 AI 写出来的值（手动优先，不是兜底）
+    —— 旧文本里有的组，重写结果里不管 AI 写成什么，都强制改回你选的那个；
+    —— 旧文本里没有的组，才让 AI 自己判断。 */
+function keepParams(newText, oldText) {
+  let t = newText || "";
+  ALL_PARAMS.forEach((g) => {
+    const mine = readParam(oldText, g.label);
+    if (mine) t = setParam(t, g.label, mine);
+  });
+  return t;
+}
+
 function openBoardSheet(bid) {
   const b = board(bid);
   if (!b) return;
+  // 参数以独立字段为准（老数据没有该字段时，从正文里解析出来作为初值）
+  const sp = b.shot_params || {};
+  SHEET_PARAMS = {
+    img: { ...parseParams(b.image_prompt, SHOT_PARAMS), ...(sp.img || {}) },
+    video: { ...parseParams(b.video_prompt, MOVE_PARAMS), ...(sp.video || {}) },
+  };
   openSheet(`
     <div class="sheet-title">镜头 ${b.shot_number} · 提示词</div>
-    <div class="sheet-sub">改完记得保存；AI 重写会保留你写死的细节</div>
+    <div class="sheet-sub">改完记得保存；下拉里选的参数会压过 AI 重写的版本</div>
     <label class="field-label">剧情作用</label>
     <textarea id="bd-desc" rows="2">${esc(b.description)}</textarea>
     <label class="field-label">台词 / 旁白（没有留空）</label>
@@ -1027,15 +1558,19 @@ function openBoardSheet(bid) {
     <label class="field-label">时长（2–5 秒）</label>
     <input id="bd-dur" type="number" min="2" max="5" value="${b.duration}">
     <label class="field-label">生图提示词</label>
+    ${paramGridHtml("bd-imgp", SHOT_PARAMS)}
     <textarea id="bd-imgp" rows="6">${esc(b.image_prompt)}</textarea>
     <label class="field-label">视频提示词</label>
     <textarea id="bd-vidp" rows="4">${esc(b.video_prompt || "")}</textarea>
+    ${paramGridHtml("bd-vidp", MOVE_PARAMS)}
     <label class="field-label">AI 重写指令（可选）</label>
     <input id="bd-feedback" placeholder="如：镜头缓缓推近，情绪更压抑">
     <div style="display:flex;gap:8px;margin-top:16px;">
       <button class="btn btn-ghost" style="flex:1;" onclick="aiRewriteBoard('${b.id}')">✨ AI 重写</button>
       <button class="btn btn-primary" style="flex:1;" onclick="saveBoard('${b.id}')">保存</button>
     </div>`);
+  syncParamGrid("bd-imgp", SHOT_PARAMS, SHEET_PARAMS.img);
+  syncParamGrid("bd-vidp", MOVE_PARAMS, SHEET_PARAMS.video);
 }
 function saveBoard(bid) {
   const b = board(bid);
@@ -1043,27 +1578,40 @@ function saveBoard(bid) {
   b.description = $("bd-desc").value.trim();
   b.dialogue = $("bd-dialogue").value.trim();
   b.duration = Math.min(5, Math.max(2, parseInt($("bd-dur").value) || 3));
-  b.image_prompt = $("bd-imgp").value.trim();
-  b.video_prompt = $("bd-vidp").value.trim();
+  // 参数字典单独存一份，同时保证正文里带着它们（生图/生视频都读正文）
+  b.shot_params = { img: { ...SHEET_PARAMS.img }, video: { ...SHEET_PARAMS.video } };
+  b.image_prompt = applyParams($("bd-imgp").value.trim(), SHEET_PARAMS.img);
+  b.video_prompt = applyParams($("bd-vidp").value.trim(), SHEET_PARAMS.video);
   touch(); closeSheet(); renderBoards(); toast("已保存");
 }
 async function aiRewriteBoard(bid) {
   const b = board(bid);
   const st = S.cur.data.story;
   if (!b) return;
+  // 修改框当前内容优先：用户改完没点「保存」直接点 AI 重写，也必须按框里最新内容重写
+  const desc = (($("bd-desc")?.value ?? b.description) || "").trim();
+  const dialogue = (($("bd-dialogue")?.value ?? b.dialogue) || "").trim();
+  const duration = Math.min(5, Math.max(2, parseInt($("bd-dur")?.value) || b.duration || 3));
+  const oldPrompt = (($("bd-imgp")?.value ?? b.image_prompt) || "").trim();
+  const oldVidPrompt = (($("bd-vidp")?.value ?? b.video_prompt) || "").trim();
+  // 下拉选中的参数即使正文被清空也要生效：发给 AI 前先把它们并进旧提示词
+  const sendPrompt = applyParams(oldPrompt, SHEET_PARAMS.img);
+  const sendVidPrompt = applyParams(oldVidPrompt, SHEET_PARAMS.video);
   showBusy("AI 正在重写提示词…", "分镜提示词 + 视频提示词一起更新");
   try {
     const r = await api("/api/regenerate-prompt", {
       type: "storyboard",
       name: "镜头 " + b.shot_number,
-      description: b.description, dialogue: b.dialogue, duration: b.duration,
+      description: desc, dialogue: dialogue, duration: duration,
       style_bible: (st && st.style_bible) || "",
       synopsis: (st && st.synopsis) || "",
       characters: ((st && st.characters) || []).map((c) => ({ name: c.name, image_prompt: c.image_prompt })),
-      old_prompt: b.image_prompt, feedback: ($("bd-feedback").value || "").trim() || undefined,
+      old_prompt: sendPrompt || "", feedback: ($("bd-feedback").value || "").trim() || undefined,
     });
-    b.image_prompt = r.image_prompt || b.image_prompt;
-    if (r.video_prompt) b.video_prompt = r.video_prompt;
+    b.description = desc; b.dialogue = dialogue; b.duration = duration;  // 框内改动一并写回
+    b.shot_params = { img: { ...SHEET_PARAMS.img }, video: { ...SHEET_PARAMS.video } };
+    b.image_prompt = applyParams(keepParams(r.image_prompt || oldPrompt || b.image_prompt, oldPrompt), SHEET_PARAMS.img);
+    if (r.video_prompt) b.video_prompt = applyParams(keepParams(r.video_prompt, oldVidPrompt), SHEET_PARAMS.video);
     hideBusy(); touch(); openBoardSheet(bid);
     toast("提示词已重写");
   } catch (e) { hideBusy(); toast(e.message, true); }
@@ -1131,6 +1679,64 @@ function buildVideoEnvContext(b) {
   }
   return parts.join("；");
 }
+/* ---------- 生成视频前的确认弹窗：运镜放在最上面，选完直接提交 ----------
+   之前「🎬 视频」一点就提交，运镜藏在「提示词」抽屉最底部，等于没有入口。 */
+function openVideoSheet(bid) {
+  const b = board(bid);
+  if (!b) return;
+  if (!b.images.length) return toast("先生成分镜图", true);
+  const sp = (b.shot_params && b.shot_params.video) || {};
+  const cur = sp["运镜"] || readParam(b.video_prompt, "运镜");
+  const hasPrompt = !!(b.video_prompt || "").trim();
+  openSheet(`
+    <div class="sheet-title">镜头 ${b.shot_number} · 生成视频</div>
+    <div class="sheet-sub">选运镜会写进视频提示词；不选就按现有提示词生成</div>
+    <label class="field-label">运镜</label>
+    <div class="param-grid" style="grid-template-columns:1fr;">
+      <label class="param-cell"><select id="vs-move" onchange="onVideoMovePick()">
+        <option value="">不指定</option>
+        ${MOVE_PARAMS[0].opts.map((o) => `<option value="${esc(o)}">${esc(o)}</option>`).join("")}
+      </select></label>
+    </div>
+    <label class="field-label">视频提示词${hasPrompt ? "（可直接改）" : "（还空着，建议先点「✨ AI 重写」）"}</label>
+    <textarea id="vs-prompt" rows="5" placeholder="画面怎么动、镜头怎么走、主体做什么">${esc(b.video_prompt || "")}</textarea>
+    <div style="display:flex;gap:8px;margin-top:16px;">
+      <button class="btn btn-ghost" style="flex:1;" onclick="closeSheet()">取消</button>
+      <button class="btn btn-ghost" style="flex:1;" onclick="stashVideoEdit('${b.id}');closeSheet();openBoardSheet('${b.id}')">改提示词</button>
+      <button class="btn btn-primary" style="flex:1.4;" onclick="confirmVideo('${b.id}')">🎬 开始生成</button>
+    </div>`);
+  const sel = $("vs-move");
+  if (sel) sel.value = cur ? matchOptValue(MOVE_PARAMS[0], cur) : "";
+}
+function onVideoMovePick() {
+  const sel = $("vs-move"), ta = $("vs-prompt");
+  if (ta) ta.value = setParam(ta.value, "运镜", sel ? sel.value : "");
+}
+/** 把弹窗里的运镜与提示词写回数据（正文必须带运镜：生成视频只读 video_prompt） */
+function stashVideoEdit(bid) {
+  const b = board(bid);
+  if (!b) return;
+  const sel = $("vs-move"), ta = $("vs-prompt");
+  const v = sel ? sel.value : "";
+  b.video_prompt = setParam(((ta && ta.value) || "").trim(), "运镜", v);
+  b.shot_params = b.shot_params || { img: {}, video: {} };
+  b.shot_params.video = b.shot_params.video || {};
+  if (v) b.shot_params.video["运镜"] = v; else delete b.shot_params.video["运镜"];
+  touch();
+}
+function confirmVideo(bid) {
+  const b = board(bid);
+  if (!b) return;
+  stashVideoEdit(bid);
+  closeSheet();
+  // 光有「运镜：xx」不算提示词——剥掉参数后要有真正的画面内容，否则生成出来不对
+  const body = (b.video_prompt || "")
+    .replace(/运镜\s*[:：][^，,；;、。\n】]*/g, "")
+    .replace(/[，,；;、。\s]+/g, "")
+    .trim();
+  if (!body) return toast("视频提示词是空的，先点「✨ AI 重写」补上画面内容再生成", true);
+  genBoardVideo(bid);
+}
 async function genBoardVideo(bid) {
   const b = board(bid);
   if (!b || b.videoStatus === "running") return;
@@ -1188,6 +1794,154 @@ async function genBoardVideo(bid) {
   }
   touch(); renderBoards();
 }
+/* ---------- 分镜配音：台词 → VoxCPM 合成（可选角色克隆音色） ---------- */
+async function openDubSheet(bid) {
+  const b = board(bid);
+  if (!b) return;
+  if (S.voiceReady === null) await voiceStatusProbe();
+  if (!S.voiceReady) { openVoiceHelp(); return; }
+  const chars = (((S.cur.data.story || {}).characters) || []).filter((c) => c.voice_url);
+  const presets = S.voicePresets || [];
+  const hasChars = chars.length > 0;
+  openSheet(`
+    <div class="sheet-title">镜头 ${b.shot_number} · 配音</div>
+    <label class="field-label">台词 / 旁白（会同步写回分镜）</label>
+    <textarea id="dub-text" rows="3">${esc(b.dialogue || "")}</textarea>
+    ${b.dialogue ? "" : `<p class="lib-empty" style="text-align:left;margin-top:4px;">分镜里还没有台词，直接在上面写一段即可</p>`}
+    <label class="field-label">音色</label>
+    <select id="dub-voice">
+      ${hasChars ? `<optgroup label="角色克隆音色">${chars.map((c, ci) => `<option value="${ci}"${ci === 0 ? " selected" : ""}>🎭 ${esc(c.name)}${c.voice_text ? "" : "（缺参考文本 ⚠️）"}</option>`).join("")}</optgroup>` : ""}
+      ${presets.length ? `<optgroup label="预设音色">${presets.map((p, pi) => `<option value="preset:${p.id}"${!hasChars && pi === 0 ? " selected" : ""}>${esc(p.label)}</option>`).join("")}</optgroup>` : ""}
+      <option value=""${hasChars || presets.length ? "" : " selected"}>🎲 随机音色（音色不稳，仅供测试）</option>
+    </select>
+    ${hasChars ? "" : `<p class="lib-empty" style="text-align:left;margin-top:4px;">想要专属声音：到「角色场景」页打开角色设定，上传 5-20 秒清晰人声，并把这段音频里说的那句话逐字填进「音色参考文本」</p>`}
+    <button class="btn btn-primary btn-block" id="dub-gen" onclick="genDub('${b.id}')">🔊 生成配音</button>
+    ${(b.dubs || []).length ? `<label class="field-label">已生成的配音</label>${b.dubs.map((d, di) => `
+      <div class="dub-item">
+        <span class="dub-tag">🔊 ${esc(d.voice || "随机音色")}</span>
+        <audio controls preload="metadata" src="${d.url}"></audio>
+        <button class="vbtn" title="下载此配音" onclick="downloadDub('${b.id}',${di})">⬇</button>
+        <button class="vbtn" title="删除此配音" onclick="delDub('${b.id}',${di})">🗑</button>
+      </div>`).join("")}` : ""}`);
+}
+async function genDub(bid) {
+  const b = board(bid);
+  const btn = $("dub-gen");
+  if (!b || !btn) return;
+  const text = ($("dub-text").value || "").trim();
+  if (!text) return toast("先填写台词 / 旁白", true);
+  b.dialogue = text; // 顺手写回分镜，保持台词与配音一致
+  const sel = $("dub-voice");
+  const chars = (((S.cur.data.story || {}).characters) || []).filter((c) => c.voice_url);
+  // 音色三选一："" 随机 / preset:ID 预设音色 / 数字 角色克隆音色
+  const v = sel ? sel.value : "";
+  const presetId = v.startsWith("preset:") ? v.slice(7) : null;
+  const pick = /^\d+$/.test(v) ? chars[parseInt(v)] : null;
+  btn.classList.add("busy");
+  btn.textContent = "提交任务…";
+  // 异步任务模式：提交立即返回 job_id，轮询结果（云端 CPU 合成，同步等待会被网关掐断）
+  const submitAndPoll = async () => {
+    const r = await api("/api/generate-dub", {
+      text,
+      voice_url: pick ? pick.voice_url : undefined,
+      voice_text: pick ? (pick.voice_text || "") : undefined,
+      preset_id: presetId || undefined,
+    }, "POST", 30000);
+    if (!r.job_id) throw new Error("提交任务失败");
+    let res = null;
+    for (let t = 0; t < 96; t++) {
+      await new Promise((s) => setTimeout(s, 5000));
+      res = await api(`/api/dub-result?job_id=${encodeURIComponent(r.job_id)}`, undefined, "GET", 15000);
+      if (res.status === "done") break;
+      if (res.status === "error") throw new Error(res.detail || "合成失败");
+      if (t % 4 === 3) btn.textContent = `合成中… ${Math.round((t + 1) * 5 / 6) / 10} 分钟`;
+    }
+    if (!res || res.status !== "done") throw new Error("合成超时（约 8 分钟），请稍后重试");
+    return res;
+  };
+  try {
+    let res;
+    try {
+      res = await submitAndPoll();
+    } catch (e) {
+      // 沙箱偶发重启会有几秒服务空窗，自动重试一次
+      const connErr = /ConnectError|Connection refused|还没就绪|503|fetch/i.test(e.message || "");
+      if (!connErr) throw e;
+      btn.textContent = "配音服务重启中，30 秒后自动重试…";
+      await new Promise((s) => setTimeout(s, 30000));
+      res = await submitAndPoll();
+    }
+    b.dubs ||= [];
+    const vLabel = presetId ? ((S.voicePresets || []).find((p) => p.id === presetId) || {}).label || "预设音色" : (pick ? pick.name : "");
+    b.dubs.push({ url: res.audio_url, voice: vLabel });
+    touch(); renderBoards(); renderVoiceBoardList(); openDubSheet(bid);
+    toast("配音已生成");
+  } catch (e) {
+    toast(e.message, true);
+  }
+  btn.classList.remove("busy");
+  btn.textContent = "🔊 生成配音";
+}
+function delDub(bid, idx) {
+  const b = board(bid);
+  if (!b || !b.dubs || !b.dubs[idx]) return;
+  const [gone] = b.dubs.splice(idx, 1);
+  touch(); renderBoards(); renderVoiceBoardList();
+  if ($("dub-text")) openDubSheet(bid); // 配音抽屉开着时刷新列表
+  if (gone) purgeServerFiles([gone.url]);
+}
+// 下载角色参考音频（音色样本）
+async function downloadVoice(ci) {
+  const c = (((S.cur?.data.story || {}).characters) || [])[ci];
+  if (!c?.voice_url) return toast("该角色未设定音色", true);
+  try {
+    const resp = await fetch(c.voice_url);
+    if (!resp.ok) throw new Error("HTTP " + resp.status);
+    const blob = await resp.blob();
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = `音色参考_${c.name || ci}.wav`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+  } catch (e) {
+    toast("下载失败，改为新标签打开", true);
+    window.open(c.voice_url, "_blank");
+  }
+}
+// 下载配音音频：blob 方式触发保存（手机浏览器 download 属性常被忽略，blob 兜底更稳）
+async function downloadDub(bid, idx) {
+  const b = board(bid);
+  const d = b?.dubs?.[idx];
+  if (!d?.url) return toast("配音不存在", true);
+  try {
+    const resp = await fetch(d.url);
+    if (!resp.ok) throw new Error("HTTP " + resp.status);
+    const blob = await resp.blob();
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    const shot = b.shot_number ? `镜头${b.shot_number}` : bid;
+    const voice = d.voice || "随机音色";
+    const ts = new Date().toISOString().slice(5, 16).replace(/[T:]/g, "-");
+    a.download = `配音_${shot}_${voice}_${ts}.wav`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+  } catch (e) {
+    toast("下载失败，改为新标签打开", true);
+    window.open(d.url, "_blank"); // 兜底：新标签打开可长按/右键保存
+  }
+}
+function delDubAudio(bid, idx) {
+  // 音频 404（文件被清理过）时自动摘除坏条目，不整体报错
+  const b = board(bid);
+  if (!b || !b.dubs || !b.dubs[idx]) return;
+  b.dubs.splice(idx, 1);
+  touch(); renderBoards(); renderVoiceBoardList();
+}
+
 function startPoll(bid) {
   stopPoll(bid);
   S.pollers[bid] = setInterval(() => pollOnce(bid), 4000);
@@ -1282,6 +2036,28 @@ function saveVideoWorkflow() {
 function renderSettings() {
   $("set-workflow").value = getVideoWorkflow();
   syncOrientSeg();
+  promptLibProbe(); // 探测提示词库是否就绪（失败/未配置自动隐藏入口，静默）
+  voiceStatusProbe(); // 探测配音微服务（未启动时设置页显示启动说明）
+}
+/* ================= 配音服务（VoxCPM 声音克隆微服务） ================= */
+/* voiceStatusProbe 定义在「配音页」区块（class 版，同时更新配音页与设置页的状态卡） */
+function openVoiceHelp() {
+  openSheet(`
+    <div class="sheet-title">🔊 配音服务（VoxCPM 声音克隆）</div>
+    <p style="font-size:13.5px;line-height:1.7;margin:6px 0 10px;">
+      ${S.voiceReady ? "✅ 服务已就绪，可以正常生成配音。"
+        : S.voiceWarming ? "⏳ 模型预热中：在线版首次部署会自动下载模型（约 1GB，几分钟），完成后即可正常配音，请稍后点「重新探测」。"
+        : "⚠️ 服务不可用：在线版稍等几分钟让模型完成下载预热后重试；本地版需在电脑上启动配音微服务。"}
+    </p>
+    <div class="card pad" style="font-size:13px;line-height:1.9;">
+      在线版：无需任何操作，发布后自动预热（模型下载 → 常驻内存）。<br>
+      本地版启动方法（在项目目录 AI-anime-studio-3D-mobile 下执行）：<br>
+      <code style="word-break:break-all;">C:/Users/ZYY/Downloads/VoxCPM-main/venv/Scripts/python.exe voice_server.py</code><br>
+      · 默认端口 8021，改端口后需在 .env 加 VOICE_SERVER_URL=http://127.0.0.1:端口<br>
+      · CPU 推理：每句台词约 10 秒 - 3 分钟（视机器而定），请耐心等待<br>
+      · 声音克隆：在「角色场景」页给角色上传 5-20 秒清晰人声 + 填写参考文本
+    </div>
+    <button class="btn btn-ghost btn-block" onclick="closeSheet(); S.voiceReady = null; S.voiceWarming = false; voiceStatusProbe()">🔄 重新探测</button>`);
 }
 async function renderApiKeys() {
   const el = $("settings-masked");
@@ -1379,6 +2155,181 @@ function setOrientation(o) {
   touch(); syncOrientSeg();
   if (S.tab === "boards") renderBoards();
   toast(o === "landscape" ? "已切换横屏：新生成画面为 1920×1080" : "已切换竖屏：新生成画面为 1080×1920");
+}
+
+/* ================= 提示词库（Open Image Prompts 语料检索） ================= */
+S.libReady = null;   // null=未探测 / true / false
+S.libItems = [];     // 最近一次检索结果（复制按钮按索引取）
+
+async function promptLibProbe() {
+  if (S.libReady !== null) return S.libReady;
+  try {
+    const r = await api("/api/prompt-library/status", undefined, "GET", 15000);
+    S.libReady = !!r.ready;
+    if (!r.ready) console.log("[提示词库] 未就绪：", r.reason || "");
+  } catch (e) {
+    S.libReady = false;
+    console.log("[提示词库] 状态探测失败：", e.message);
+  }
+  const card = $("prompt-lib-card");
+  if (card) card.classList.toggle("hidden", !S.libReady);
+  return S.libReady;
+}
+
+async function openPromptLibrary() {
+  const ready = await promptLibProbe();
+  if (!ready) return toast("提示词库未就绪：服务器未配置语料库（OIP_DB_PATH）", true);
+  openSheet(`
+    <div class="sec-title">📚 提示词库检索 <span class="sec-hint">与题目相关的真实优秀提示词，借鉴镜头感与光线写法</span></div>
+    <div class="chat-input-row" style="margin-top:10px;">
+      <input id="lib-q" type="text" placeholder="描述画面：主体 + 光线 + 氛围" onkeydown="if(event.key==='Enter')runPromptSearch()">
+      <button class="send-btn" onclick="runPromptSearch()">➤</button>
+    </div>
+    <div class="lib-chips">
+      <button class="lib-chip" onclick="libQuick('黄昏公园逆光人物剪影')">黄昏逆光剪影</button>
+      <button class="lib-chip" onclick="libQuick('雨夜霓虹街道少女撑伞')">雨夜霓虹街道</button>
+      <button class="lib-chip" onclick="libQuick('日系教室课后 少女')">日系教室</button>
+      <button class="lib-chip" onclick="libQuick('古风水墨 江湖剑客')">古风剑客</button>
+      <button class="lib-chip" onclick="libQuick('科幻 机甲 未来城市')">科幻机甲</button>
+    </div>
+    <div id="lib-results" class="lib-results"><p class="lib-empty">写清「主体 + 光线 + 氛围」效果最好；叙事句子也会自动宽松匹配</p></div>
+  `);
+  setTimeout(() => { const el = $("lib-q"); if (el) el.focus(); }, 120);
+}
+
+function libQuick(q) {
+  const input = $("lib-q");
+  if (!input) return;
+  input.value = q;
+  runPromptSearch();
+}
+
+async function runPromptSearch() {
+  const q = ($("lib-q")?.value || "").trim();
+  if (!q) return;
+  const box = $("lib-results");
+  if (!box) return;
+  box.innerHTML = `<p class="lib-empty">检索中…</p>`;
+  try {
+    const r = await api("/api/prompt-search", { q, limit: 8 }, "POST", 60000);
+    const items = [...(r.results || []), ...(r.related_results || [])];
+    S.libItems = items;
+    if (!items.length) {
+      box.innerHTML = `<p class="lib-empty">没有找到匹配的参考，换个更具体的画面描述试试（写清主体+光线+氛围）</p>`;
+      return;
+    }
+    const stats = [];
+    if (typeof r.exact_match_count === "number") stats.push(`严格命中 ${r.exact_match_count}`);
+    if (r.fallback && r.fallback.used && r.fallback.added) stats.push(`宽松补足 ${r.fallback.added}`);
+    const statLine = stats.length ? `<p class="lib-stat">${esc(stats.join(" · "))}（共 ${items.length} 条）</p>` : "";
+    box.innerHTML = statLine + items.map(libItemHtml).join("");
+  } catch (e) {
+    box.innerHTML = `<p class="lib-empty">检索失败：${esc(e.message)}</p>`;
+  }
+}
+
+function libItemHtml(it, i) {
+  const tags = (it.tags || []).slice(0, 6).map((t) => `<span class="lib-tag">${esc(t.zh || t.id)}</span>`).join("");
+  const zh = it.prompt_zh || "";
+  const en = it.prompt_text || "";
+  const zhEsc = esc(zh);
+  return `
+  <div class="lib-item">
+    <div class="lib-meta">#${i + 1} · ${esc(it.tool || "未知模型")} · 匹配分 ${it.score ?? "-"}${it.match_kind === "related" ? " · 相关推荐" : ""}</div>
+    ${zh ? `<div class="lib-zh">${zhEsc}</div>` : ""}
+    ${en && en !== zh ? `<details class="lib-en"><summary>查看原文</summary><div class="lib-en-text">${esc(en)}</div></details>` : ""}
+    ${tags ? `<div class="lib-tags">${tags}</div>` : ""}
+    <div class="lib-actions">
+      <button class="btn btn-ghost lib-btn" onclick="copyPromptLibText(${i})">📋 复制</button>
+      ${it.source_url ? `<a class="lib-link" href="${esc(it.source_url)}" target="_blank" rel="noopener">🔗 来源</a>` : ""}
+    </div>
+  </div>`;
+}
+
+function copyPromptLibText(i) {
+  const it = S.libItems[i];
+  const text = it ? (it.prompt_zh || it.prompt_text || "") : "";
+  if (!text) return toast("没有可复制的内容", true);
+  const done = () => toast("已复制到剪贴板");
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(done, () => fallbackCopyText(text, done));
+  } else {
+    fallbackCopyText(text, done);
+  }
+}
+function fallbackCopyText(text, done) {
+  const ta = document.createElement("textarea");
+  ta.value = text;
+  ta.style.position = "fixed";
+  ta.style.opacity = "0";
+  document.body.appendChild(ta);
+  ta.select();
+  try { document.execCommand("copy"); done(); }
+  catch (_) { toast("复制失败，请长按文本手动复制", true); }
+  ta.remove();
+}
+
+/* ================= 风格卡参考（img-gen-taste 可视化） ================= */
+S.scCache = S.scCache || {};
+
+async function openStyleCards() {
+  openSheet(`
+    <div class="sec-title">🎨 风格卡参考 <span class="sec-hint">10 个美术方向的要点卡；点开复制后粘贴进画风圣经或生图提示词</span></div>
+    <div id="sc-list" class="sc-list"><p class="lib-empty">加载中…</p></div>
+  `);
+  try {
+    const r = await api("/api/style-cards", undefined, "GET", 15000);
+    const cards = r.cards || [];
+    const list = $("sc-list");
+    if (!list) return;
+    if (!cards.length) {
+      list.innerHTML = `<p class="lib-empty">没有可用的风格卡</p>`;
+      return;
+    }
+    list.innerHTML = cards.map((c) => `
+      <div class="sc-item" onclick="toggleStyleCard('${esc(c.id)}')">
+        <div class="sc-head"><b>${esc(c.title)}</b><span class="sc-id">${esc(c.id)}</span></div>
+        <p class="sc-summary">${esc(c.summary)}</p>
+        <div class="sc-detail hidden" id="sc-detail-${esc(c.id)}"></div>
+      </div>`).join("");
+  } catch (e) {
+    const list = $("sc-list");
+    if (list) list.innerHTML = `<p class="lib-empty">加载失败：${esc(e.message)}</p>`;
+  }
+}
+
+async function toggleStyleCard(id) {
+  if (!/^[a-z0-9-]{2,40}$/.test(id)) return;
+  const box = $("sc-detail-" + id);
+  if (!box) return;
+  if (!box.classList.contains("hidden")) { box.classList.add("hidden"); return; }
+  box.classList.remove("hidden");
+  if (box.dataset.loaded) return;
+  box.innerHTML = `<p class="lib-empty">加载中…</p>`;
+  try {
+    const r = await api("/api/style-cards/" + id, undefined, "GET", 15000);
+    S.scCache[id] = r.content || "";
+    box.innerHTML = `
+      <pre class="sc-content">${esc(r.content)}</pre>
+      <div class="lib-actions">
+        <button class="btn btn-ghost lib-btn" onclick="copyStyleCardContent('${esc(id)}')">📋 复制要点</button>
+        <span class="lib-hint">粘贴进「画风圣经」或生图提示词作参考</span>
+      </div>`;
+    box.dataset.loaded = "1";
+  } catch (e) {
+    box.innerHTML = `<p class="lib-empty">加载失败：${esc(e.message)}</p>`;
+  }
+}
+
+async function copyStyleCardContent(id) {
+  const text = S.scCache[id] || "";
+  if (!text) return toast("内容未加载，请稍后再试", true);
+  const done = () => toast("已复制，可粘贴进画风圣经或提示词");
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(done, () => fallbackCopyText(text, done));
+  } else {
+    fallbackCopyText(text, done);
+  }
 }
 
 /* ================= 调度图 ================= */

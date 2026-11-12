@@ -3,10 +3,15 @@
 
 # ===== 本地数据 / 用户生成内容 =====
 studio.db
+studio.db.bak-*
 static/uploads/
 static/temp/
 
+# ===== 配音模型权重（1.5GB，由 voice_server 自动下载）=====
+models/
+
 # ===== 日志 =====
+*.log
 debug_prompts.log
 
 # ===== Python =====
@@ -20,3 +25,7 @@ __pycache__/
 # ===== 系统杂项 =====
 Thumbs.db
 Desktop.ini
+oip/data/
+
+# ===== 误生成的重复副本目录 =====
+static/style-previews/style-previews/

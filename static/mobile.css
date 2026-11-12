@@ -283,6 +283,10 @@ textarea { resize: none; line-height: 1.6; }
 }
 .board-actions { display: flex; gap: 8px; padding: 10px 14px 14px; }
 .board-actions .btn { flex: 1; padding: 10px 4px; font-size: 13.5px; }
+/* 卡片上的当前运镜标签：点一下直接进生成视频弹窗 */
+.move-chip { display: block; width: fit-content; margin: 0 14px 2px; padding: 4px 9px; border: 0; border-radius: 8px;
+  font-size: 11px; color: var(--muted, #6b7280); background: #eef0fb; cursor: pointer; font-family: inherit; }
+.move-chip:active { background: #e2e5f7; }
 
 /* ---------- 底部抽屉 ---------- */
 .sheet-mask { position: fixed; inset: 0; background: rgba(20,22,40,.45); z-index: 60; animation: fadein .15s; }
@@ -309,6 +313,25 @@ textarea { resize: none; line-height: 1.6; }
 .sheet-sub { font-size: 12.5px; color: var(--muted); margin-bottom: 14px; }
 .sheet-img-preview { width: 100%; border-radius: 14px; margin-bottom: 12px; display: block; }
 .field-label { display: block; font-size: 13px; font-weight: 600; color: #3c3f47; margin: 12px 0 6px; }
+
+/* ---------- 画面参数下拉（景别/景深/机位/焦段/构图/光线/运镜） ---------- */
+.param-grid {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(92px, 1fr));
+  gap: 6px; margin: 0 0 8px;
+}
+.param-cell { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.param-cell > span { font-size: 10.5px; color: var(--muted); padding-left: 2px; }
+.param-cell select {
+  width: 100%; padding: 7px 20px 7px 7px; font-size: 12px; color: var(--ink);
+  background: #fbfbff; border: 1px solid var(--line); border-radius: 9px;
+  appearance: none; -webkit-appearance: none;
+  background-image: linear-gradient(45deg, transparent 50%, #9aa0b4 50%),
+                    linear-gradient(135deg, #9aa0b4 50%, transparent 50%);
+  background-position: calc(100% - 12px) 50%, calc(100% - 8px) 50%;
+  background-size: 4px 4px, 4px 4px; background-repeat: no-repeat;
+  text-overflow: ellipsis;
+}
+.param-cell select:focus { border-color: var(--accent); outline: none; }
 .sheet-preview-row { display: flex; gap: 8px; overflow-x: auto; margin: 10px 0; }
 .sheet-preview-row img { width: 86px; height: 86px; object-fit: cover; border-radius: 10px; flex-shrink: 0; }
 .ref-add-btn {
@@ -458,3 +481,148 @@ body.board-drag-noselect, body.board-drag-noselect * { user-select: none !import
   white-space: nowrap;
 }
 .zone-badge.zone-admin { color: #d97706; background: rgba(217, 119, 6, 0.12); }
+
+/* ---------- 提示词库（Open Image Prompts 语料检索） ---------- */
+.lib-results { margin-top: 12px; display: flex; flex-direction: column; gap: 10px; }
+.lib-empty { color: var(--muted); font-size: 13.5px; text-align: center; padding: 18px 8px; }
+.lib-item {
+  background: #f8f9ff; border: 1px solid var(--line); border-radius: 12px;
+  padding: 10px 12px;
+}
+.lib-meta { font-size: 12px; color: var(--muted); margin-bottom: 6px; }
+.lib-zh { font-size: 13.5px; line-height: 1.6; white-space: pre-wrap; word-break: break-word; }
+.lib-en { margin-top: 6px; font-size: 12.5px; }
+.lib-en summary { color: var(--accent-ink); cursor: pointer; user-select: none; }
+.lib-en-text { margin-top: 6px; color: var(--muted); line-height: 1.6; white-space: pre-wrap; word-break: break-word; }
+.lib-tags { margin-top: 8px; display: flex; flex-wrap: wrap; gap: 5px; }
+.lib-tag {
+  font-size: 11px; padding: 2px 8px; border-radius: 999px;
+  background: var(--accent-soft); color: var(--accent-ink); white-space: nowrap;
+}
+.lib-actions { margin-top: 8px; display: flex; align-items: center; gap: 12px; }
+.lib-btn { padding: 6px 12px; font-size: 13px; border-radius: 10px; }
+.lib-link { font-size: 13px; color: var(--accent-ink); text-decoration: none; }
+.lib-link:active { opacity: .7; }
+.lib-stat { font-size: 12px; color: var(--muted); padding: 0 2px; }
+.lib-chips { margin-top: 10px; display: flex; flex-wrap: wrap; gap: 6px; }
+.lib-chip {
+  font-size: 12.5px; padding: 5px 12px; border-radius: 999px;
+  background: var(--accent-soft); color: var(--accent-ink); white-space: nowrap;
+}
+.lib-hint { font-size: 12px; color: var(--muted); }
+
+/* ---------- 风格卡参考 ---------- */
+.sc-list { margin-top: 12px; display: flex; flex-direction: column; gap: 10px; }
+.sc-item {
+  background: #f8f9ff; border: 1px solid var(--line); border-radius: 12px;
+  padding: 10px 12px;
+}
+.sc-head { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+.sc-head b { font-size: 14px; }
+.sc-id { font-size: 11px; color: var(--muted); white-space: nowrap; }
+.sc-summary { margin-top: 4px; font-size: 12.5px; color: var(--muted); line-height: 1.5; }
+.sc-detail { margin-top: 8px; }
+.sc-content {
+  font-family: inherit; font-size: 12.5px; line-height: 1.65; white-space: pre-wrap;
+  word-break: break-word; color: var(--ink);
+  background: #fff; border: 1px solid var(--line); border-radius: 10px;
+  padding: 10px; max-height: 46vh; overflow: auto; margin: 0;
+}
+
+/* ---------- 配音（VoxCPM） ---------- */
+.board-dubs { margin-top: 8px; display: flex; flex-direction: column; gap: 6px; }
+.dub-item {
+  display: flex; align-items: center; gap: 8px;
+  background: var(--accent-soft, #f1f3ff); border: 1px solid var(--line);
+  border-radius: 12px; padding: 6px 8px;
+}
+.dub-item audio { flex: 1; height: 34px; min-width: 0; }
+.dub-tag {
+  font-size: 11px; padding: 3px 8px; border-radius: 999px;
+  background: var(--accent-ink, #4f46e5); color: #fff; white-space: nowrap;
+  max-width: 96px; overflow: hidden; text-overflow: ellipsis;
+}
+.voice-ref-item {
+  position: relative; display: flex; align-items: center; gap: 6px;
+  background: #fff; border: 1px solid var(--line); border-radius: 10px;
+  padding: 6px 8px; max-width: 100%;
+}
+.voice-ref-item audio { height: 34px; max-width: 210px; }
+#voice-card.voice-off { opacity: .72; }
+#voice-card.voice-off .sec-title::after {
+  content: " · 离线"; font-size: 11px; color: var(--danger, #dc2626);
+}
+
+/* ---------- 6 项底部 tab 收紧 ---------- */
+.tabbar-item { font-size: 10.5px; padding: 6px 0 5px; }
+.tabbar-item svg { width: 22px; height: 22px; }
+.styles-intro { padding-bottom: 12px; }
+.voice-placeholder { text-align: center; padding: 28px 18px; }
+
+/* ---------- 风格库：可视化选择画廊 ---------- */
+.style-gallery {
+  display: grid; grid-template-columns: 1fr 1fr; gap: 10px; padding: 2px 0 10px;
+}
+.style-card {
+  display: flex; flex-direction: column; border-radius: 14px; overflow: hidden;
+  background: var(--card, #fff); border: 1px solid var(--line, rgba(0,0,0,.08));
+  box-shadow: 0 1px 4px rgba(15,23,42,.06);
+}
+.style-thumb {
+  position: relative; aspect-ratio: 4 / 3; background: #23263a; overflow: hidden;
+}
+.style-thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.style-emoji {
+  position: absolute; left: 6px; top: 6px; font-size: 14px;
+  background: rgba(10,11,18,.55); border-radius: 8px; padding: 2px 6px;
+  backdrop-filter: blur(4px);
+}
+.style-info { padding: 8px 10px 4px; flex: 1; }
+.style-info b { font-size: 13.5px; }
+.style-info p {
+  margin: 4px 0 0; font-size: 11.5px; line-height: 1.5; color: #8a8f99;
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+}
+.style-actions { display: flex; gap: 6px; padding: 8px 10px 10px; }
+.style-btn { flex: 1; font-size: 12px; padding: 7px 4px; border-radius: 9px; }
+#style-cat-seg { margin-bottom: 10px; }
+
+/* ---------- 配音页（工作台） ---------- */
+.vrow {
+  display: flex; align-items: center; gap: 8px;
+  padding: 9px 4px; border-bottom: 1px solid var(--line);
+}
+.vrow:last-child { border-bottom: none; }
+.vrow-main { flex: 1; display: flex; align-items: center; gap: 8px; min-width: 0; }
+.vrow-name { font-size: 14px; white-space: nowrap; }
+.vrow-no {
+  flex-shrink: 0; width: 26px; height: 26px; border-radius: 8px;
+  background: var(--accent-soft, #f1f3ff); color: var(--accent-ink, #4f46e5);
+  display: flex; align-items: center; justify-content: center;
+  font-size: 12.5px; font-weight: 700;
+}
+.vrow-text { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 4px; }
+.vrow-line { font-size: 13px; line-height: 1.5; word-break: break-word; }
+.vrow-text audio { width: 100%; height: 32px; }
+.vrow-miss { font-size: 11.5px; color: var(--muted); white-space: nowrap; }
+.vrow .btn { flex-shrink: 0; }
+
+/* ---------- 预选风格提示条 ---------- */
+.pending-style {
+  display: flex; align-items: center; flex-wrap: wrap; gap: 6px;
+  padding: 10px 12px; border-radius: 12px; font-size: 13px;
+  background: rgba(124, 58, 237, 0.10); border: 1px solid rgba(124, 58, 237, 0.25);
+  margin-bottom: 10px;
+}
+
+/* ---------- 分镜卡右上角 加/减 操作钮 ---------- */
+.head-ops { display: flex; gap: 4px; flex-shrink: 0; }
+.head-op {
+  width: 22px; height: 22px; border-radius: 50%;
+  border: 1px solid var(--line); background: #fff;
+  font-size: 13px; line-height: 1; color: var(--ink);
+  display: flex; align-items: center; justify-content: center;
+  padding: 0; cursor: pointer;
+}
+.head-op:active { background: #f0f1f8; }
+.head-op-del { color: var(--danger, #dc2626); }
