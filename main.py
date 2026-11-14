@@ -9,7 +9,7 @@ import uuid
 import shutil
 import asyncio
 import zipfile
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 from pathlib import Path
 from typing import List, Dict, Any
 from fastapi import FastAPI, HTTPException, Query, File, UploadFile, Request
@@ -232,6 +232,8 @@ def deepseek_json(response) -> Any:
 
 DOUBAO_BASE = "https://ark.cn-beijing.volces.com/api/v3"
 DOUBAO_MODEL = os.getenv("DOUBAO_MODEL", "doubao-seedream-5-0-flash-260915")
+# 豆包 Seedance 视频生成（火山方舟 contents/generations/tasks）：与生图共用 ARK_API_KEY
+DOUBAO_VIDEO_MODEL = os.getenv("DOUBAO_VIDEO_MODEL", "doubao-seedance-2-5-260628")
 
 AUTODL_TOKEN = os.getenv("AUTODL_TOKEN")
 AUTODL_I2V_TOKEN = os.getenv("AUTODL_I2V_TOKEN", "")  # 可选：首尾帧应用(U02)独立令牌，留空则用 AUTODL_TOKEN
@@ -257,6 +259,7 @@ class ImageRequest(BaseModel):
 class VideoRequest(BaseModel):
     prompt: str
     image_urls: list[str] = []
+    ref_meta: List[Dict[str, Any]] | None = None  # 与 image_urls 一一对应：{kind,name}，用于把角色/场景/道具设定图的作用注入提示词
     duration: int = 5
     resolution: str = "768p"
     workflow_id: str | None = None
@@ -266,6 +269,12 @@ class VideoRequest(BaseModel):
     image_aspect: float | None = None   # 首张参考图的宽/高比（前端计算传入），用于自动选横竖屏档位；未传时后端 Pillow 本地实测兜底
     plot_data: dict | None = None       # 调度图坐标数据（轨迹图优先），翻译成自然语言运动轨迹指令注入视频提示词
     env_context: str | None = None      # 场景环境锁定（前端从分镜生图提示词抽取的地点/风格/光线段落）：视频提示词往往只写动作，不写环境，模型会自由脑补场景（实测跑成室内）
+    video_engine: str = "autodl"        # autodl=AutoDL ComfyUI 工作流（默认） / doubao=豆包 Seedance（火山方舟 Ark）
+    video_model: str | None = None      # doubao 引擎的 Seedance 模型 ID（如 doubao-seedance-2-5-260628），空则用全局默认
+    doubao_resolution: str | None = None  # doubao 引擎输出分辨率：480p（≈0.7元/秒）/ 720p（≈1.5元/秒）/ 1080p（10bit，≈1.7元/秒）
+    page_origin: str | None = None      # 前端页面地址（location.origin）：经代理转发时后端请求头的 host 是内网地址，不可信
+    ref_video_urls: list[str] = []      # 垫参考视频（Seedance reference_video）：引导运镜/构图/节奏，不入成片
+    share_code: str | None = None       # 页面链接里的 sharecode：把本地上传的垫视频拼成公网直链给 Ark/AutoDL 拉取
 
 class BrainstormRequest(BaseModel):
     step: int
@@ -282,9 +291,13 @@ class RegeneratePromptRequest(BaseModel):
     duration: int = 3                      # 分镜用
     style_bible: str | None = None         # 全片画风圣经
     synopsis: str | None = None            # 剧情梗概
-    characters: List[Dict[str, Any]] | None = None  # [{name, image_prompt}] 角色外观锚点
+    characters: List[Dict[str, Any]] | None = None  # [{name, image_prompt, outfits:[{name, image_prompt}]}] 角色外观锚点（含多套服装）
+    scenes: List[Dict[str, Any]] | None = None      # [{name, image_prompt, description}] 场景设定（解析【场景】引用用）
+    props: List[Dict[str, Any]] | None = None       # [{name, image_prompt, description}] 道具设定
     old_prompt: str | None = None          # 旧提示词（在其基础上重写）
+    old_video_prompt: str | None = None    # 旧视频提示词（用户手改过的版本；视频提示词在它基础上重写，不从零重来）
     feedback: str | None = None            # 用户的新要求（最高优先级）
+    furniture: List[Dict[str, Any]] | None = None  # 场景用：家具布置 [{label, x, y, w, h, facing}]（0-1 归一化，上=空间深处）
 
 # ---------- 0.9 Open Image Prompts 提示词库：检索参考 + 美术风格卡 ----------
 def _oip_reference_block(query: str, *, limit: int = 3) -> str:
@@ -425,7 +438,7 @@ STORY_SYSTEM_PROMPT = """你是一位资深的 AI 动画短片导演兼提示词
 1. storyboards 数量 8-16 个，按剧情节奏编排；第一个镜头必须能在 3 秒内抓住眼球（悬念/冲击画面/反差）。
 2. 景别要有剪辑感：相邻镜头避免连续使用相同景别，重点情绪用特写强调，转场处可用大远景。
 3. 同一场景内的相邻镜头，时间、天气、光线必须连续一致；跨场景才允许变化。
-4. duration 只能取 2 到 5 的整数：静态对话 2-3 秒，动作镜头 3-5 秒。
+4. duration 取 2 到 15 的整数：静态对话 2-4 秒，常规动作镜头 3-8 秒，重大场面（大战/蒙太奇/长情绪戏）可到 10-15 秒；按内容节奏自然分配，不要全部拉满。
 5. dialogue 短而口语化，单镜头不超过两句；没有台词就留空字符串，不要硬凑。
 6. 所有分镜 image_prompt 中同一角色的外观描述，必须与该角色 image_prompt 逐字相同——这是参考图机制下保持角色一致性的关键。
 7. 全片画风、色调必须统一，由 style_bible 锁定；不得中途变换风格。
@@ -588,21 +601,28 @@ def _param_block(params: Dict[str, str], labels) -> str:
 
 REGEN_SYSTEM_PROMPT = """你是 AI 动画工作台的提示词重写引擎，负责把一条不够精细的生图提示词重写成工业级提示词。
 
-【画风圣经】用户会提供全片统一的画风描述（style_bible），重写后的 image_prompt 必须以它的原文开头，保证全片画风一致。
+【画风圣经】用户会提供全片统一的画风描述（style_bible），重写后的 image_prompt 和 video_prompt 都必须以它的原文开头，保证全片画风一致。
 
 【四类提示词的固定规范】
 1. 角色（character）：角色设定图。style_bible 原文 + 「单人全身立绘、完整入画（头顶到脚踝全部可见）、正面或四分之三侧面、自然站姿目视镜头、简洁纯色浅背景、柔和均匀打光」+ 逐一写死可复用的外观锚点：发型发色、瞳色、五官特征、体型年龄、服装款式与颜色、随身标志物。60-120 字。禁止出现场景、动作戏、其他人物。
 2. 场景（scene）：场景设定空镜。style_bible 原文 + 大远景空镜（画面中无人物）+ 空间布局与 2-3 个标志性陈设 + 时间天气 + 光线方向。60-120 字。严禁出现任何人物或人影。
 3. 道具（prop）：道具设定图。style_bible 原文 + 「单件道具特写陈列图，画面中无人物，浅色纯净背景，柔和均匀布光，可附比例参照」+ 材质、颜色、形态结构、新旧磨损细节、标志性特征。40-80 字。禁止出现场景环境或无关物体堆砌。
-4. 分镜（storyboard）：结构化模板，单行输出，小节用【】标题依次排列，每个小节必须写：【画面内容】在(地点)，(谁)正在(做什么)，画面正在发生(具体事件)，出现的角色逐字复用其角色锚点的外貌服装描述，写明表情与动作瞬间；【镜头细节】焦段(如35mm/85mm)、构图(主体居中/对称/前景遮挡)、景别(远/全/中/近/特)、机位(固定/低角度/俯拍/仰拍)；【美术风格】style_bible 原文；【光源】光源类型(顶光/逆光/侧光/蝴蝶光/伦勃朗光/硬光/柔光/自然光等)及光如何影响场景；【氛围】观众的情绪感受；【影调】冷暖色调、饱和度、明暗关系；【约束】正向表达：无文字水印分格、动作自然符合物理规律、本镜头需锁定的要点。上下文不足写【待补：说明】，禁止编造。
+4. 分镜（storyboard）：结构化模板，单行输出，小节用【】标题依次排列，每个小节必须写：【画面内容】在(地点)，(谁)正在(做什么)，画面正在发生(具体事件)，出现的角色逐字复用其角色锚点的外貌描述（发型/五官/体型等；服装按「中括号引用解析」执行），写明表情与动作瞬间；【镜头细节】焦段(如35mm/85mm)、构图(主体居中/对称/前景遮挡)、景别(远/全/中/近/特)、机位(固定/低角度/俯拍/仰拍)；【美术风格】style_bible 原文；【光源】光源类型(顶光/逆光/侧光/蝴蝶光/伦勃朗光/硬光/柔光/自然光等)及光如何影响场景；【氛围】观众的情绪感受；【影调】冷暖色调、饱和度、明暗关系；【约束】正向表达：无文字水印分格、动作自然符合物理规律、本镜头需锁定的要点。上下文不足写【待补：说明】，禁止编造。
 
 【硬性禁止】画面出现任何文字、字幕、水印、边框、分格、多格拼图；禁止抽象词（如“幸福”“回忆”“命运”）；禁止把台词写进画面。
 
-【video_prompt 规范】仅分镜类型需要输出，单行输出：【动作时序】首先…然后…最后…(总时长=该镜头持续秒数)；【镜头运动】推/拉/摇/移/环绕/跟随/固定机位；【声音】仅当有明确声音需求时注明，没有就省略。画面起点即该分镜图。硬性禁止：引入分镜图中不存在的新人物/物体/场景；禁止“突然”“闪现”“切换到”等跳变词；不要复述静态外观。
+【video_prompt 规范】仅分镜类型需要输出，单行输出，以画风圣经原文开头，后接：【动作时序】首先…然后…最后…(总时长=该镜头持续秒数)；【镜头运动】推/拉/摇/移/环绕/跟随/固定机位；【声音】仅当有明确声音需求时注明，没有就省略。画面起点即该分镜图。硬性禁止：引入分镜图中不存在的新人物/物体/场景；禁止“突然”“闪现”“切换到”等跳变词；不要复述静态外观。
 
 【用户修改要求】旧提示词是用户当前工作框内的内容，是最高优先级的内容来源：其中用户亲笔写下的具体细节（人物年龄、体型、五官、服装、随身物、动作、表情、地点、道具、光源、氛围、风格等）必须逐字保留，严禁替换、省略、泛化或"换种说法"。重写只允许做三件事：①把内容套进对应类型的结构化模板并分节；②补全模板要求但用户没写的维度（不确定的写【待补：说明】，禁止编造）；③语言规范化。若角色锚点与用户描述冲突，一律以用户描述为准；若旧提示词很短且明显是一句修改指令（如"换成雨夜"）而非完整提示词，将其整体视为用户的新要求，结合上下文重写出完整的结构化提示词。
+【中括号资产引用必须原样保留】旧提示词（及设定描述、修改要求）里用【名字】或[名字]中括号括起来的内容，若是角色/场景/道具/服装的名字（如【木兰·铠甲】【村庄】【木剑】），是导演对资产设定图的显式引用指令：重写后的提示词必须原样保留每一个这样的引用——保持中括号形式与名字逐字不变，可自然融入对应描述句中，严禁删除、改名、丢掉括号或换成别的说法。注意【画面内容】【美术风格】【镜头细节】等固定段落标签不是资产引用，不受本条约束。
+【中括号服装引用＝换装指令，必须按那套服装写】中括号引用若形如【角色·服装名】或【服装名】（如【花木兰·民女打扮】【民女打扮】），是导演指定"该角色本镜头穿这套衣服"的换装指令，不是随便写的标签：
+① 画面里的服装款式、颜色、材质、发式头饰、鞋履、随身小物，必须按用户消息「中括号引用解析结果」里那套服装的设定原文去写（那是该套服装的权威外观）；
+② 严禁沿用角色锚点里的默认服装（不能因为她本体锚点写着铠甲/战袍，就把民女打扮写成铠甲），严禁两套服装元素混穿；
+③ 面部、发型长度、瞳色、体型、年龄仍按角色锚点，与服装不冲突；
+④ 该组中括号本身要逐字保留在提示词里（前端靠它挂该套服装的参考图）；
+⑤ 若引用解析结果标注"没有对应资产"，则按用户写的字面意思写，并在【约束】里注明服装以文字为准。
 【描述框与提示词框冲突裁决】设定描述和旧提示词都是用户修改框里的最新手改内容；两者在基础设定（年龄/性别/身份/发型/体型/服装）上冲突时，以设定描述为准，把旧提示词里的过时版本改写成描述版本（例：描述写"26岁女性"而旧提示词写"16岁少女"，必须重写为26岁女性），这不算违背逐字保留原则——逐字保留只适用于与最新设定不冲突的细节；旧提示词里有而描述没提的细节（动作、构图、随身物等）仍然逐字保留。
-【画风圣经优先级】画风圣经是硬约束，优先级高于旧提示词里的画风描述：重写后的 image_prompt 必须以画风圣经原文开头；若旧提示词中的风格措辞与画风圣经冲突，以圣经为准更新（其余用户细节仍按上一条逐字保留）。用户没提供画风圣经时才按旧提示词原有风格写。
+【画风圣经优先级】画风圣经是硬约束，优先级高于旧提示词里的画风描述：重写后的 image_prompt 与 video_prompt 都必须以画风圣经原文开头；若旧提示词（含视频提示词）中的风格措辞与画风圣经冲突，以圣经为准更新（其余用户细节仍按上一条逐字保留）。用户没提供画风圣经时才按旧提示词原有风格写。
 【追加的指令要落实】用户在框内追加或修改的指令式短句（如"空镜头""不要人物""去掉XX""换成雨夜""加一面镜子"）是用户新要求：必须把它落实为规范中对应位置的具体描述（例如"空镜头"落实为"大远景空镜（画面中无人物）"，并保证全文没有任何人物痕迹），而不是把原句原样缀在提示词结尾；落实完成后提示词里不得残留指令原文。判断依据：该短句与提示词其余部分风格割裂、位置突兀（多为结尾），或描述的是"要改什么"而不是"画面里有什么"。
 
 【用户指定摄影参数是硬约束】用户消息里若给出「已指定的摄影参数」，这些值优先级最高：在【镜头细节】/【光源】等小节里必须**逐字使用这些词**（指定"景别=远景"就写"景别远景"，指定"机位=高角度仰拍"就写"机位高角度仰拍"），严禁换成近义词、近似的自造说法（不得写成"近景特写""略低仰拍"）、严禁拆分或合并；提示词其他位置也不得出现与这些参数矛盾的景别/景深/机位/焦段/构图/光线描述。指定的参数不出现在旧提示词里，你仍要主动把它们写进对应小节。
@@ -611,6 +631,302 @@ REGEN_SYSTEM_PROMPT = """你是 AI 动画工作台的提示词重写引擎，负
 【素材与资产】素材引用（参考图/音频/视频）与全局设定（资产库）是创作者的输入，不由你生成、不要虚构；相关需求写进【约束】或【待补】。
 
 【输出】严格输出 JSON：{"image_prompt": "...", "video_prompt": "..."}。非分镜类型 video_prompt 输出空字符串。不要 markdown 代码块，不要任何 JSON 之外的文字。"""
+
+# ---------- 中括号资产引用：提取与保真（与前端 parseBracketRefs 同一套语义） ----------
+_BRACKET_RE = re.compile(r"[【\[]([^\]】]{1,60})[】\]]")
+# 描述性短语结尾词：AI 重写常输出【角色·落座几何，严格按此描写】这类"角色+小标题"，
+# 后半截不是资产名，不该拿去资产库查、也不该报未匹配
+_DESC_SUFFIX = ("几何", "描写", "说明", "细节", "要求", "时序", "变化", "过程", "关系", "逻辑", "规范")
+
+# 固定段落标签（不是资产引用），与前端 BRACKET_IGNORE_TAGS 对齐并补充模板标签
+_BRACKET_IGNORE_TAGS = {
+    "画面内容", "画面", "景别", "运镜", "镜头", "机位", "台词", "对白", "旁白",
+    "美术风格", "光源", "影调", "氛围", "时长", "转场", "音效", "音乐",
+    "镜头细节", "动作时序", "镜头运动", "声音", "约束", "镜头细节",
+}
+
+# 镜头参数 / 画面约束类括号：这些是给模型的技术指令，不是资产名，不该拿去资产库查找，
+# 也不该报"未匹配"。典型写法：【景别：中景】【镜头运动：缓慢推近】【光线：暖黄侧光】
+# 【禁止出现现代元素】【人物不得看向镜头】——含冒号、或以参数名开头、或带指令动词。
+# 注意：这里只放"不可能是角色/道具/场景名"的词，别把"人物""场景""道具"这类通用词放进来。
+_BRACKET_PARAM_LABELS = {
+    "画面内容", "画面", "画面描述", "画面构成", "景别", "取景", "运镜", "镜头", "镜头运动",
+    "镜头语言", "镜头细节", "镜头角度", "机位", "机位位置", "视角", "摄像机", "摄影机",
+    "构图", "画幅", "画质", "比例", "分辨率", "尺寸",
+    "台词", "对白", "旁白", "字幕", "音效", "音乐", "声音", "时长", "转场", "节奏",
+    "美术风格", "风格", "画风", "画风参考", "光源", "光线", "光影", "影调", "色调",
+    "色彩", "氛围", "情绪", "表情", "动作", "动作时序", "人物数量", "人数",
+    "约束", "限制", "要求", "注意", "注意事项", "备注", "提示", "禁止", "避免", "参考",
+}
+# 指令/约束动词：括号内容带这些词基本是拍法要求，不是资产名
+_BRACKET_RULE_WORDS = (
+    "禁止", "严禁", "不得", "不能", "不可", "不要", "避免", "切勿", "必须", "务必",
+    "需要", "应该", "确保", "保持", "尽量", "只有", "仅有", "只能", "只需", "只要",
+    "不出现",
+)
+
+
+def _is_param_bracket(text: str) -> bool:
+    """判断一段中括号内容是否是"镜头参数/画面约束"（不是资产引用）。
+
+    命中任一条件即视为约束，整段跳过、不查找、不提示：
+      1. 固定段落标签 / 参数名标签
+      2. 含中英文冒号的"标签：取值"结构（资产名不会带冒号）
+      3. 含禁止/必须/不得这类指令动词
+      4. 以参数名开头或结尾（如"景别近景""机位正前方"）
+      5. 【待补：xx】占位符
+    """
+    s = (text or "").strip()
+    if not s:
+        return True
+    if s in _BRACKET_IGNORE_TAGS or s in _BRACKET_PARAM_LABELS:
+        return True
+    if s.startswith("待补"):
+        return True
+    if "：" in s or ":" in s:
+        return True
+    if any(w in s for w in _BRACKET_RULE_WORDS):
+        return True
+    # "构图 人物居左三分线"：参数名打头且紧跟分隔符 → 约束（不限长度）
+    # "人物居左三分线构图"：以参数名收尾且整段不长 → 约束
+    # 注意不能用"参数名打头且整段短"这条：道具名"参考书"会被误杀
+    for lbl in _BRACKET_PARAM_LABELS:
+        if len(lbl) < 2 or s == lbl:
+            continue
+        if s.startswith(lbl) and len(s) > len(lbl) and s[len(lbl)] in " ：:·•|/-、,，.。;；":
+            return True
+        if s.endswith(lbl) and len(s) <= len(lbl) + 6:
+            return True
+    return False
+
+
+def _looks_descriptive(part: str) -> bool:
+    """【花木兰·落座几何，严格按此描写】这类括号：`·` 后面跟的是这一段的"小标题/写法要求"，
+    不是资产名。AI 重写常这么写，若拿去资产库查就会误报"未匹配"。按结尾词判定。"""
+    s = (part or "").strip()
+    if not s:
+        return True
+    return any(s.endswith(suf) for suf in _DESC_SUFFIX)
+
+
+def _looks_like_shot_param(text: str) -> bool:
+    """宽松判定：只在"这个 part 已经确认匹配不到任何资产"之后才用。
+    资产库查不到、又带镜头参数名/指令词的，基本就是【景别近景】这类约束碎块，
+    静默忽略比报"未匹配"友好（此处放宽不会误伤真实资产，因为资产已匹配失败）。"""
+    s = (text or "").strip()
+    if not s:
+        return True
+    if _is_param_bracket(s) or _looks_descriptive(s):
+        return True
+    if any(lbl in s for lbl in _BRACKET_PARAM_LABELS):
+        return True
+    return False
+
+
+def extract_bracket_asset_names(*texts) -> list:
+    """从多段文本里提取【名字】/[名字] 括起来的资产名。
+    段落标签、【景别：中景】这类镜头参数/画面约束、待补占位都不算引用。"""
+    out, seen = [], set()
+    for text in texts:
+        if not text:
+            continue
+        for m in _BRACKET_RE.findall(str(text)):
+            if _is_param_bracket(m):
+                continue
+            for part in re.split(r"[·•|/、,，;；\s]+", m):
+                t = part.strip()
+                if not t or t in _BRACKET_IGNORE_TAGS or t in seen or t.startswith("待补"):
+                    continue
+                seen.add(t)
+                out.append(t)
+    return out
+
+
+def _bracket_groups(*texts) -> list:
+    """提取中括号引用并按组拆 part（【花木兰·民女打扮】→ ["花木兰","民女打扮"]）。
+    与前端 parseBracketGroups 同一套语义：段落标签、镜头参数/画面约束、待补占位都不算引用。"""
+    groups, seen = [], set()
+    for text in texts:
+        if not text:
+            continue
+        for m in _BRACKET_RE.findall(str(text)):
+            if _is_param_bracket(m):   # 整段是镜头约束（含冒号/指令词/参数名）→ 整段跳过
+                continue
+            parts = [p.strip() for p in re.split(r"[·•|/、,，;；\s]+", m)]
+            parts = [p for p in parts
+                     if p and p not in _BRACKET_IGNORE_TAGS and not p.startswith("待补")
+                     and not _is_param_bracket(p)]
+            key = "|".join(parts)
+            if parts and key not in seen:
+                seen.add(key)
+                groups.append((m.strip(), parts))
+    return groups
+
+
+def _name_hit(part: str, name: str) -> bool:
+    """引用名与资产名的模糊匹配：相等，或长词包含短词（双向），≥2 字才算。
+    防「民女打扮」vs「民女装」这类书写细差漏判。"""
+    if not part or not name:
+        return False
+    return (part == name
+            or (len(part) >= 2 and part in name)
+            or (len(name) >= 2 and name in part))
+
+
+def resolve_bracket_groups(texts, characters=None, scenes=None, props=None) -> list:
+    """把中括号引用解析到具体资产（角色本体 / 该角色的某套服装 / 场景 / 道具）。
+
+    关键点：【角色·服装】必须落到该角色的**那一套服装**上——组内先认角色，
+    其余 part 优先在该角色的 outfits 里匹配，最后才回退到全局场景/道具名单。
+    """
+    out = []
+    chars = [c for c in (characters or []) if isinstance(c, dict) and c.get("name")]
+    scs = [s for s in (scenes or []) if isinstance(s, dict) and s.get("name")]
+    prs = [p for p in (props or []) if isinstance(p, dict) and p.get("name")]
+    for bracket, parts in _bracket_groups(*texts):
+        item = {"bracket": bracket, "parts": parts,
+                "character": None, "outfit": None, "scenes": [], "props": [], "unresolved": []}
+        consumed = set()
+        # ① 角色 + 该角色的服装变体
+        for c in chars:
+            cname = str(c.get("name") or "")
+            hit_idx = [i for i, p in enumerate(parts) if _name_hit(p, cname)]
+            if not hit_idx:
+                continue
+            consumed.update(hit_idx)
+            item["character"] = {"name": cname, "appearance": str(c.get("image_prompt") or "")}
+            for o in c.get("outfits") or []:
+                if not isinstance(o, dict):
+                    continue
+                oname = str(o.get("name") or "")
+                if not oname:
+                    continue
+                o_idx = [i for i, p in enumerate(parts) if i not in hit_idx and _name_hit(p, oname)]
+                if o_idx:
+                    item["outfit"] = {
+                        "name": oname, "owner": cname,
+                        "appearance": str(o.get("image_prompt") or o.get("description") or ""),
+                    }
+                    consumed.update(o_idx)
+                    break
+        # ② 场景 / 道具（未被角色组吃掉的部分）
+        leftover = [p for i, p in enumerate(parts) if i not in consumed]
+        for s in scs:
+            sname = str(s.get("name") or "")
+            if any(_name_hit(p, sname) for p in leftover):
+                s_appear = str(s.get("image_prompt") or s.get("description") or "")
+                # 场景在资产里摆了家具布置（大型家具/门窗位置朝向）→ 追加进引用说明，
+                # 重写分镜提示词时必须照此布局写环境，防止门/窗/大件家具在镜头间漂移
+                _fb = _furn_brief(s.get("furniture"))
+                if _fb:
+                    s_appear = (s_appear + "。" if s_appear else "") + _fb
+                item["scenes"].append({"name": sname,
+                                       "appearance": s_appear})
+                consumed.update(i for i, p in enumerate(parts) if _name_hit(p, sname))
+        for pr in prs:
+            pname = str(pr.get("name") or "")
+            if any(_name_hit(p, pname) for p in leftover):
+                item["props"].append({"name": pname,
+                                      "appearance": str(pr.get("image_prompt") or pr.get("description") or "")})
+                consumed.update(i for i, p in enumerate(parts) if _name_hit(p, pname))
+        # 兜底：拆出来的碎块里仍有约束味儿（如"中景，平视"被逗号拆散）的一律不算未匹配
+        item["unresolved"] = [p for i, p in enumerate(parts)
+                              if i not in consumed and not _looks_like_shot_param(p)]
+        out.append(item)
+    return out
+
+
+_OUTFIT_WORDS = ("身穿", "身着", "穿着", "换上", "披着", "头戴", "腰佩", "服饰", "服装",
+                 "铠甲", "盔甲", "战袍", "袍", "裙", "袄", "衫", "披风", "腰带", "靴", "鞋", "布巾", "头巾")
+
+
+def _strip_outfit_phrases(anchor: str) -> str:
+    """从角色锚点里剔除"服装类"分句。本镜已用【角色·服装】指定服装时，
+    锚点里的盔甲/袍服描写会跟被引用服装打架（实测会把民女打扮画回铠甲），故剔除。"""
+    if not anchor:
+        return ""
+    clauses = re.split(r"[，,。；;、]", anchor)
+    keep = [c for c in clauses if c.strip() and not any(w in c for w in _OUTFIT_WORDS)]
+    return "，".join(keep)
+
+
+def _bracket_ref_block(refs) -> str:
+    """把解析结果写成给重写模型的权威说明块（没有可解析引用时返回空串）。"""
+    lines = []
+    for r in refs:
+        ch, of = r.get("character"), r.get("outfit")
+        if of:
+            face = _strip_outfit_phrases(ch.get("appearance") or "") if ch else ""
+            lines.append(
+                f"- 【{r['bracket']}】＝角色「{of['owner']}」的服装「{of['name']}」（换装引用：本镜头该角色就穿这套）。"
+                f"服装/发饰/鞋履/随身小物必须按这套服装的设定写：{of['appearance'] or '（该套服装暂无文字描写，按服装名与角色锚点合理推断，不得编造与名字不符的服饰）'}。"
+                "严禁改写成该角色的默认服装（如铠甲/战袍/婚服），也严禁两套服装混穿；"
+                f"面部/发型/瞳色/体型仍按角色锚点{'：' + face if face else ''}"
+            )
+        elif ch:
+            face = _strip_outfit_phrases(ch.get("appearance") or "")
+            if r.get("unresolved"):
+                lines.append(
+                    f"- 【{r['bracket']}】＝角色「{ch['name']}」＋资产库里还没建的造型「{'、'.join(r['unresolved'])}」："
+                    f"面部/发型/瞳色/体型按角色锚点{'（' + face + '）' if face else ''}；"
+                    f"服装按「{'、'.join(r['unresolved'])}」这个名称的字面含义描写（这是导演指定的换装/状态），"
+                    "不得回落成角色锚点里的默认服装，并在【约束】注明该造型还没有设定图、以文字为准。"
+                )
+            else:
+                lines.append(
+                    f"- 【{r['bracket']}】＝角色「{ch['name']}」：外形/发型/瞳色/体型/服装按角色锚点写"
+                    f"{'：' + (ch.get('appearance') or '') if ch.get('appearance') else '（无锚点文字）'}。"
+                )
+        for s in r.get("scenes") or []:
+            lines.append(
+                f"- 【{r['bracket']}】＝场景「{s['name']}」：地点、空间结构、陈设、光线按该场景设定写"
+                f"{'：' + s['appearance'] if s.get('appearance') else '（无设定文字，按场景名写环境，不得编造人物）'}。"
+            )
+        for p in r.get("props") or []:
+            lines.append(
+                f"- 【{r['bracket']}】＝道具「{p['name']}」：材质、颜色、形态、磨损按该道具设定写"
+                f"{'：' + p['appearance'] if p.get('appearance') else '（无设定文字，按道具名写外形）'}。"
+            )
+        if r.get("unresolved") and not ch:
+            lines.append(
+                f"- 【{r['bracket']}】里「{'、'.join(r['unresolved'])}」在资产库里没有对应角色/服装/场景/道具："
+                "中括号原样保留（前端会据此提示补建设定），外形按文字与常识写，不得编造具体设定。"
+            )
+    if not lines:
+        return ""
+    return "中括号引用解析结果（权威，重写时必须照此写外观；括号名逐字保留）：\n" + "\n".join(lines)
+
+
+def _furn_pos_line(p: dict) -> str:
+    """家具布置条目 → 位置描述文字（与前端 furniturePromptBlock 同一套词，保证 2D 图纸/3D 导演台/提示词三方一致）。"""
+    try:
+        x = min(1.0, max(0.0, float(p.get("x") if p.get("x") is not None else 0.5)))
+        y = min(1.0, max(0.0, float(p.get("y") if p.get("y") is not None else 0.5)))
+    except (TypeError, ValueError):
+        x, y = 0.5, 0.5
+    xs = "画左" if x < 0.33 else ("画右" if x > 0.67 else "画面中部")
+    ys = "远景（空间深处）" if y < 0.33 else ("前景（靠近镜头）" if y > 0.67 else "中景")
+    try:
+        fv = float(p.get("facing") or 0) % 360
+    except (TypeError, ValueError):
+        fv = 0
+    if fv < 45 or fv >= 315:
+        fw = "正面朝空间深处"
+    elif fv < 135:
+        fw = "正面朝画右"
+    elif fv < 225:
+        fw = "正面朝向镜头"
+    else:
+        fw = "正面朝画左"
+    return f"{str(p.get('label') or '家具')[:8]}：{xs}{ys}，{fw}"
+
+def _furn_brief(furniture) -> str:
+    """场景家具布置 → 一句话布局描述（供提示词重写/翻译时锁定大型家具与门窗位置朝向）。
+    与前端 furnitureBrief 同一套词；位置/朝向措辞同 _furn_pos_line。"""
+    items = [p for p in (furniture or []) if isinstance(p, dict)]
+    if not items:
+        return ""
+    return "家具布置（大型家具与门窗的位置、朝向固定，任何镜头不得改变）：" + "；".join(_furn_pos_line(p) for p in items)
 
 @app.post("/api/regenerate-prompt")
 async def regenerate_prompt(req: RegeneratePromptRequest):
@@ -624,22 +940,60 @@ async def regenerate_prompt(req: RegeneratePromptRequest):
     # 界面下拉手选的参数：先提取出来，作为硬约束单独下发，并从旧提示词里摘掉
     picked = extract_shot_params(req.old_prompt)
     img_picked = {k: v for k, v in picked.items() if k != "运镜"}
+    # 运镜参数：图片提示词里没选时，从旧视频提示词里补提（用户常只在视频框选运镜）
+    old_vid_src = (req.old_video_prompt or "").strip()
     vid_picked = {"运镜": picked["运镜"]} if picked.get("运镜") else {}
+    if not vid_picked and old_vid_src:
+        _vpick = extract_shot_params(old_vid_src)
+        if _vpick.get("运镜"):
+            vid_picked = {"运镜": _vpick["运镜"]}
     old_prompt_clean = strip_shot_params(req.old_prompt, list(picked)) if picked else (req.old_prompt or "")
+    # 视频提示词同样要剥掉手选运镜（它会作为硬约束单独下发，重写结果里再统一拼回）
+    old_vid_clean = strip_shot_params(old_vid_src, list(vid_picked)) if (vid_picked and old_vid_src) else old_vid_src
     user_lines = []
     if req.style_bible:
         user_lines.append(f"画风圣经（重写后必须以其原文开头）：{req.style_bible}")
     if req.synopsis:
         user_lines.append(f"剧情梗概：{req.synopsis}")
+    # 中括号引用解析：把【花木兰·民女打扮】这类引用落到具体资产上，
+    # 让重写按"被引用的那套服装/那个场景"的真实设定写外观，而不是回落到角色默认造型
+    bracket_refs = resolve_bracket_groups(
+        [old_prompt_clean, req.old_prompt, req.description, req.feedback],
+        characters=req.characters, scenes=req.scenes, props=req.props,
+    )
+    # 本镜实际被引用的服装（角色名 → 服装名集合）：用于把角色锚点里的服装描写剔除，
+    # 否则"花木兰：…身穿青灰铠甲…"会和【花木兰·民女打扮】的布裙描写互相打架
+    picked_by_char: Dict[str, set] = {}
+    for _r in bracket_refs:
+        _of = _r.get("outfit")
+        if _of:
+            picked_by_char.setdefault(_of["owner"], set()).add(_of["name"])
     if t == "storyboard" and req.characters:
+        def _anchor_of(c):
+            name = str(c.get("name") or "")
+            txt = str(c.get("image_prompt") or "")
+            outs = [str(o.get("name") or "") for o in (c.get("outfits") or [])
+                    if isinstance(o, dict) and o.get("name")]
+            if name in picked_by_char:
+                txt = _strip_outfit_phrases(txt) or "（面部/发型/体型见角色设定图）"
+                txt += f"〔本镜换装：{'、'.join(sorted(picked_by_char[name]))}——服装按该套设定写，锚点里的服装描写本镜不用〕"
+            if outs:
+                txt += f"〔该角色另有服装变体：{'、'.join(outs)}〕"
+            return txt
         anchors = "；".join(
-            f"{str(c.get('name') or '')}：{str(c.get('image_prompt') or '')}" for c in req.characters
+            f"{str(c.get('name') or '')}：{_anchor_of(c)}" for c in req.characters
         )
         user_lines.append(
             f"角色外观锚点（导演在角色卡上最终确定的最新外貌，权威基准）：{anchors}\n"
             "  重写规则：用户当前提示词里与锚点矛盾的过时外貌描述（性别/发型/体格/五官等）必须更新为锚点版本，不得原样保留；"
-            "仅当提示词明确写了与锚点不同的服装或造型（剧情需要换装）时，该处按提示词执行，其余外貌特征仍按锚点。"
+            "**服装不按角色锚点默认套装写**：凡提示词用中括号引用了某个服装变体（如【花木兰·民女打扮】），"
+            "本镜头服装一律按下方「中括号引用解析结果」里那套服装的设定写；只有提示词没写服装引用、"
+            "也没写与锚点不同的服装时，才用角色锚点里的服装。"
         )
+    if bracket_refs:
+        blk = _bracket_ref_block(bracket_refs)
+        if blk:
+            user_lines.append(blk)
     user_lines.append(f"要重写的提示词类型：{type_label}")
     if req.name:
         user_lines.append(f"名称：{req.name}")
@@ -653,6 +1007,13 @@ async def regenerate_prompt(req: RegeneratePromptRequest):
         user_lines.append(f"该镜头时长：{req.duration} 秒")
     if old_prompt_clean:
         user_lines.append(f"用户当前版本的提示词（其中与最新设定不冲突的细节必须逐字保留；基础设定与设定描述冲突时按描述改写）：{old_prompt_clean}")
+    if t == "storyboard" and old_vid_clean:
+        user_lines.append(
+            "用户当前版本的视频提示词（导演手改过的版本，是重写视频提示词的基础，严禁忽略后从零重写）：" + old_vid_clean + "\n"
+            "  视频提示词重写规则：①用户亲笔写的动作时序、镜头运动、声音细节与最新设定不冲突的必须逐字保留，严禁替换、省略或换种说法；"
+            "②只允许：套进标准单行结构、补全缺失维度、落实下方新要求；"
+            "③与设定描述/角色锚点冲突的过时细节按设定改写。"
+        )
     if img_picked or vid_picked:
         lines = [f"{k}={v}" for k, v in {**img_picked, **vid_picked}.items()]
         user_lines.append(
@@ -665,6 +1026,17 @@ async def regenerate_prompt(req: RegeneratePromptRequest):
         )
     if req.feedback:
         user_lines.append(f"用户的新要求（最高优先级，必须落实）：{req.feedback}")
+    # 场景家具布置：导演在场景资产里摆的俯视平面布局（与 3D 导演台同一套坐标约定），
+    # 重写时空间布局必须与此一致；生成时前端会自动把结构化清单追加进提示词，重写结果里不要重复罗列
+    if t == "scene" and req.furniture:
+        _fl = [_furn_pos_line(p) for p in req.furniture if isinstance(p, dict)]
+        _fl = [x for x in _fl if x]
+        if _fl:
+            user_lines.append(
+                "场景已有家具布置（俯视平面规划：上=空间深处/远景，下=靠近镜头/前景，左=画左，右=画右；"
+                "生成设定图时系统会自动把该清单追加进提示词）：\n- " + "\n- ".join(_fl) +
+                "\n  要求：重写提示词中的空间布局描述必须与上表一致，禁止另编家具位置或增删家具；不要在提示词里重复罗列这份清单。"
+            )
 
     # 提示词库参考：语料检索 + 风格卡（失败自动降级，不影响重写主流程）
     _ref_query = " ".join(
@@ -712,6 +1084,10 @@ async def regenerate_prompt(req: RegeneratePromptRequest):
         if not image_prompt:
             raise HTTPException(500, "重新生成失败：模型未返回提示词，请重试")
         video_prompt = str(data.get("video_prompt") or "").strip() if t == "storyboard" else ""
+        # 画风设定开头保底：系统提示词已要求，但模型偶尔漏带——这里确定性补上，
+        # 保证重写后的视频提示词永远以画风圣经原文开头（用户明确要求）
+        if video_prompt and (req.style_bible or "").strip() and not video_prompt.strip().startswith(req.style_bible.strip()[:20]):
+            video_prompt = req.style_bible.strip() + "。" + video_prompt
         # 回落保障：模型若把用户手选的参数改写成散文，统一清掉变体后重新拼成标准参数块，
         # 保证「手动选择 > AI 生成」这条优先级在任何情况下都成立。
         if img_picked:
@@ -722,6 +1098,22 @@ async def regenerate_prompt(req: RegeneratePromptRequest):
             body = strip_shot_params(video_prompt, ["运镜"])
             blk = "运镜：" + vid_picked["运镜"]
             video_prompt = (body + "，" + blk) if body else blk
+        # 中括号资产引用保真兜底：模型偶尔仍会把【木兰·铠甲】【村庄】这类引用改写掉，
+        # 而前端生图就靠这些括号名匹配资产设定图——逐个核对，丢了的原样补回。
+        if t == "storyboard":
+            user_refs = extract_bracket_asset_names(old_prompt_clean, old_vid_clean, req.description, req.feedback)
+            if user_refs:
+                # 生图提示词和视频提示词分别核对：视频参考池靠视频提示词里的【角色·服装】引用
+                # 挂设定图（用户实测教训：视频提示词丢了服装引用 → 参考池缺图 → 服装跑偏），
+                # 所以两边丢了的引用都要各自补回，不能只补生图侧。
+                miss_img = [nm for nm in user_refs if nm not in image_prompt]
+                if miss_img:
+                    image_prompt = image_prompt.rstrip("。 ") + "。资产引用：" + "".join(f"【{nm}】" for nm in miss_img)
+                miss_vid = [nm for nm in user_refs if (not video_prompt or nm not in video_prompt)]
+                if miss_vid:
+                    video_prompt = video_prompt.rstrip("。 ") + "。资产引用：" + "".join(f"【{nm}】" for nm in miss_vid)
+                if miss_img or miss_vid:
+                    print(f"[regenerate-prompt] 补回丢失的中括号引用：生图={miss_img} 视频={miss_vid}")
         log_prompt("重生成提示词", image_prompt, f"type={t}")
         return {"image_prompt": image_prompt, "video_prompt": video_prompt}
     except ValueError as e:
@@ -791,7 +1183,7 @@ TOPVIEW_SYSTEM_PROMPT = """你是动画导演的调度图纸绘制员。任务�
 【image_prompt 撰写要求】单行输出，依次包含：
 1. 图型声明（必须放最前、语气绝对）：纯正上方垂直俯视的平面调度图纸（top-down floor plan，正交投影、无透视、无景深），白底极简图纸风格，像建筑平面图/桌游沙盘顶视图；禁止画成立体透视场景，禁止动漫画面，禁止真实人物立绘。
 2. 平面布局：按场景描述用简化几何形状（线框/浅色色块）画出地面边界与主要陈设的俯视投影（桌、床、门、窗、围栏、楼梯等），可加简短名称标注；不做细节刻画。
-3. 人物棋子：每个出场角色画一个小型俯视人偶棋子图标（圆头+肩形剪影）并配角色名文字标签；图标位置即人物站位，用小箭头表示朝向；剧情中有移动的，用带箭头虚线画出运动路线。
+3. 人物棋子：只为本镜头实际入画的角色画小型俯视人偶棋子图标（圆头+肩形剪影）并配角色名文字标签——名单中未被镜头描述/口述提及的角色严禁画出（无关棋子会污染图纸）；图标位置即人物站位，用小箭头表示朝向；剧情中有移动的，用带箭头虚线画出运动路线。
 4. 摄影机：用「机位」符号标出摄影机位置，并在符号处画一个扇形/梯形视锥表示拍摄朝向与视野范围；机位有移动的用箭头标注起止。
 5. 文字约束：图上文字只允许角色名/陈设名/「机位」等简体中文短标签，禁止长句、字幕、水印。
 
@@ -803,7 +1195,7 @@ TRAJECTORY_SYSTEM_PROMPT = """你是动画导演的动作设计与运镜顾问�
 【image_prompt 撰写要求】单行输出，依次包含：
 1. 图型声明（必须放最前、语气绝对）：纯正上方垂直俯视的运动轨迹图纸（top-down floor plan，正交投影、无透视、无景深），白底极简图纸风格，彩色轨迹线醒目；禁止画成立体透视场景，禁止动漫画面，禁止真实人物立绘。
 2. 平面底图：用简化几何形状（线框/浅色色块）勾勒场景地面边界与关键陈设的俯视投影（桌、门、楼梯等）并标注名称，不做细节刻画。
-3. 角色轨迹：每个出场角色用不同颜色，从起点到终点画一条连续的轨迹线（实线箭头），轨迹上用时间刻度小圆点标出关键节点（如 0 秒起点、中途转折、终点），节点旁标注动作短语（如"起跑""转身""急停"）；起点终点画人偶棋子图标+角色名标签。
+3. 角色轨迹：只为本镜头实际入画的角色画轨迹（名单中未被镜头描述/口述提及的角色严禁画出），每个入画角色用不同颜色，从起点到终点画一条连续的轨迹线（实线箭头），轨迹上用时间刻度小圆点标出关键节点（如 0 秒起点、中途转折、终点），节点旁标注动作短语（如“起跑”“转身”“急停”）；起点终点画人偶棋子图标+角色名标签。
 4. 镜头轨迹：摄影机位置画「机位」符号+扇形视锥表示拍摄朝向，机位运动（推/拉/摇/移/跟）用黑色虚线箭头单独画出，标注方向与起止，与彩色角色轨迹区分。
 5. 速度与节奏：在轨迹线上标注快慢（如"慢走""冲刺""急停"）。
 6. 文字约束：图上文字只允许角色名/动作/秒数/「机位」等简体中文短标签，禁止长句、字幕、水印。
@@ -884,7 +1276,7 @@ DIAGRAM_PLOT_PROMPT = """你是调度图纸数据员。把导演的调度口述�
 【坐标系】x：0=图纸左，1=图纸右；y：0=图纸上方（空间远端），1=图纸下方（空间近端）。角度：0=朝图纸上方，90=朝右，180=朝下方，270=朝左，顺时针，单位度。
 【输出格式】严格只输出 JSON，不要 markdown，不要其他文字：
 {
-  "props": [{"label":"名称","shape":"rect","x":0.5,"y":0.5,"w":0.2,"h":0.15}],
+  "props": [{"label":"名称","shape":"rect","x":0.5,"y":0.5,"w":0.2,"h":0.15,"facing":0}],
   "characters": [{"name":"角色名","x":0.3,"y":0.6,"facing":0,"path":[[0.3,0.6],[0.3,0.4]],"stops":[{"t":"0秒","action":"起跑"},{"t":"3秒","action":"急停"}]}],
   "camera": {"x":0.5,"y":0.95,"facing":0,"fov":55,"path":[],"movement":"固定机位"},
   "note": "一句话备注，可为空字符串"
@@ -895,8 +1287,8 @@ DIAGRAM_PLOT_PROMPT = """你是调度图纸数据员。把导演的调度口述�
    - 「走向镜头／走向机位／走到镜头前／冲向镜头／走近摄影机／来到镜头前」：该角色 path 终点必须落在机位附近（距机位约 0.05~0.15，不与机位精确重叠），path 就是起点→机位的两点一线（最多加 1 个轻微顺路拐点，整体仍近似直线），并把 facing 改为面向机位；终点不得留在原地、也不得偏向图纸下/上方。
    - 「远离镜头／退向画面纵深／走向远处」：沿"起点→机位"连线的反方向拉开距离，facing 改为背向机位。
    - 机位在哪，"镜头前"就在哪——先看机位坐标，再落轨迹终点。
-3. props：按场景描述列出主要陈设的俯视投影（水箱、桌、床、门等），x,y 为中心点、w,h 为宽高（均为 0-1）。
-4. characters：只允许使用【出场角色】名单里的名字（输出必须与名单逐字一致）。导演口述中若用了名单外的称呼（昵称、绰号、随口叫的名字，如把"胖虎"叫成"小胖"），必须按剧情与角色描述判断它实际指名单中的哪一位，映射成名单名输出，并在 note 中注明映射关系（如"口述的小胖=胖虎"）；严禁发明名单外的角色名，同名角色只能出现一次；名单中实际出场的角色一个都不能少，口述未提及位置的角色按剧情合理推断放置并在 note 中注明。有移动的给 path（按时间顺序 2-6 个拐点）与 stops（与拐点对应）。
+3. props：按场景描述列出主要陈设的俯视投影（水箱、桌、床、门等），x,y 为中心点、w,h 为宽高（均为 0-1）；facing 为朝向角度（可选，0-360 整数，0=朝图纸上方、顺时针，门/床/柜等有明确朝向的陈设按场景描述填写，默认 0）。
+4. characters：【出场角色】名单是全剧组候选名单，不是本镜头入画名单——只把口述或镜头描述中点名/明确参与的角色放进 characters（输出名字必须与名单逐字一致）。名单中未被提及的角色【严禁】放上图纸（实测最严重错误：口述只提一个人，AI 把全剧组都摆上去——无关角色的棋子图标会污染整张图纸并传导进分镜成片）。导演口述中若用了名单外的称呼（昵称、绰号、随口叫的名字，如把"胖虎"叫成"小胖"），必须按剧情与角色描述判断它实际指名单中的哪一位，映射成名单名输出，并在 note 中注明映射关系（如"口述的小胖=胖虎"）；严禁发明名单外的角色名，同名角色只能出现一次。口述/描述用「两人」「众人」「大家」等集合词而未点名的，按剧情推断出最可能的入画角色（数量与集合词一致）并在 note 中注明推断依据；已判定入画但口述未提及其位置的角色，按剧情合理推断放置并在 note 中注明。有移动的给 path（按时间顺序 2-6 个拐点）与 stops（与拐点对应）。
    【动谁停谁（极重要）】path 只给「口述中明确点到名字且描述了移动」的角色；口述里没出现名字的角色一律 path 空数组、stops 空数组、朝向照抄起点，严禁因为剧情氛围或画面描述里的其他动作就替他安排走位（实测教训：口述只说"小帅走向镜头"，AI 让小美也走了——错误）。
 5. camera：机位位置与拍摄朝向；movement 为「固定机位」时 path 为空数组；fov 缺省 55。
 6. 所有坐标数值必须在 0-1 范围内。
@@ -1062,6 +1454,9 @@ def _merge_base_plot(plot: dict, base: dict) -> dict:
     # 陈设照抄 base：同一场景，两图坐标系一致
     if base.get("props"):
         plot["props"] = base.get("props")
+    # 房间尺寸照抄 base：同一场景，房间大小不能因 AI 重解析被洗回默认
+    if isinstance(base.get("room"), dict):
+        plot["room"] = base.get("room")
 
     # 机位起点照抄 base；仅当 AI 解析出机位移动路径时才允许动
     bc = base.get("camera") if isinstance(base.get("camera"), dict) else {}
@@ -1081,6 +1476,18 @@ def _merge_base_plot(plot: dict, base: dict) -> dict:
         plot["camera"] = pc
     return plot
 
+def _room_dims(plot: dict) -> tuple:
+    """房间真实尺寸（米）。plot.room={w:宽米,h:深米}，缺省 10×10（历史图纸兼容）。
+    归一化坐标不变（仍 0-1），只是换算米数时按房间尺寸算——3D 导演台/2D 图纸/提示词同一套换算。"""
+    room = plot.get("room") if isinstance(plot.get("room"), dict) else {}
+    out = []
+    for v in (room.get("w"), room.get("h")):
+        try:
+            out.append(round(min(50.0, max(2.0, float(v))), 1))
+        except (TypeError, ValueError):
+            out.append(10.0)
+    return out[0], out[1]
+
 def _normalize_plot(plot: dict) -> dict:
     props = []
     for p in (plot.get("props") or [])[:12]:
@@ -1092,6 +1499,9 @@ def _normalize_plot(plot: dict) -> dict:
             "x": _clamp01(p.get("x")), "y": _clamp01(p.get("y")),
             "w": min(1.0, max(0.02, _clamp01(p.get("w")) or 0.15)),
             "h": min(1.0, max(0.02, _clamp01(p.get("h")) or 0.1)),
+            # 建筑朝向（度，0=朝图纸上方、顺时针，与人物/机位同一约定）。必须在 normalize 里保留，
+            # 否则每次重绘（rerender-diagram）都会把导演在 3D 导演台转好的朝向洗掉
+            "facing": float(p.get("facing") or 0) % 360,
         })
     characters = []
     seen_names = set()
@@ -1144,8 +1554,17 @@ def _normalize_plot(plot: dict) -> dict:
         camera["height"] = cam_height
     if cam_pitch is not None:
         camera["pitch"] = cam_pitch
-    return {"props": props, "characters": characters, "camera": camera,
-            "note": str(plot.get("note") or "")[:80]}
+    # 房间尺寸（米）：导演在 3D 导演台调好的房间大小必须保留，否则每次重绘都会洗回 10×10
+    room = plot.get("room") if isinstance(plot.get("room"), dict) else None
+    out = {"props": props, "characters": characters, "camera": camera,
+           "note": str(plot.get("note") or "")[:80]}
+    if room:
+        try:
+            out["room"] = {"w": round(min(50.0, max(2.0, float(room.get("w") or 10))), 1),
+                            "h": round(min(50.0, max(2.0, float(room.get("h") or 10))), 1)}
+        except (TypeError, ValueError):
+            pass
+    return out
 
 # 角色图标配色池（醒目、互相区分）
 _DIAGRAM_PALETTE = ["#e6194b", "#3cb44b", "#4363d8", "#f58231", "#911eb4",
@@ -1162,8 +1581,12 @@ def _frame_side_text(cross: float, dist: float, fov: float) -> str:
     lat_deg = math.degrees(math.asin(max(-1.0, min(1.0, cross / dist))))  # >0=视轴右侧
     if abs(lat_deg) < 8:
         return "画面中部（几乎正对镜头）"
-    edge = "、靠近画面边缘" if abs(lat_deg) > max(fov / 2, 30) else ""
-    return ("画面右侧" if lat_deg > 0 else "画面左侧") + edge
+    side = "右侧" if lat_deg > 0 else "左侧"
+    # 细分两档：偏中 / 靠边——只说"画面左侧"时，模型常把 20° 偏移和 5° 偏移画成同一位置
+    if abs(lat_deg) < 20:
+        return f"画面{side}偏中（约偏离画面中线四分之一画幅，与画面中心之间留有空隙）"
+    edge = "、贴近画面边缘可能被裁切" if abs(lat_deg) > max(fov / 2, 30) else "、靠画面边一带"
+    return f"画面{side}{edge}"
 
 
 def _camera_height_desc(h) -> str:
@@ -1240,6 +1663,72 @@ def _camera_pitch_rule(p) -> str:
             "背景以天空或天花板为主，地面基本不可见，严禁出现俯视或平视构图。")
 
 
+def _facing_scene_anchor(plot: dict, px: float, py: float, pf: float, self_name: str, cam: dict) -> str:
+    """人物朝向的【场景内锚点】：他面朝方向锥内（陈设±55°/人物±45°）最近的门/家具/其他人物。
+    实测教训：朝向只写镜头相对描述（"正面对镜头"）时，生图模型的"人要正脸朝观众"先验
+    会压过文字——给画面里的具体目标（面朝「门」/面朝「发小」）比抽象角度服从度高得多。
+    目标在机位视野外时同样要写（他面朝画面外本身就是构图事实），并注明"在本画面之外"。"""
+    import math
+    prad = math.radians(pf % 360)
+    pfx, pfy = math.sin(prad), -math.cos(prad)
+    cx, cy = float(cam.get("x", 0.5)), float(cam.get("y", 0.95))
+    crad = math.radians(float(cam.get("facing") or 0) % 360)
+    cfx, cfy = math.sin(crad), -math.cos(crad)
+    fov = float(cam.get("fov") or 55)
+
+    def in_view(tx: float, ty: float) -> bool:
+        vx, vy = tx - cx, ty - cy
+        vd = math.hypot(vx, vy)
+        if vd < 0.15:
+            return False
+        dep = vx * cfx + vy * cfy
+        if dep <= 0:
+            return False
+        return math.degrees(math.acos(max(-1.0, min(1.0, dep / vd)))) <= fov / 2 + 25
+
+    best = None  # (角度, 是否陈设, 标签, 是否在视野内)
+    for p in (plot.get("props") or []):
+        label = str(p.get("label") or p.get("name") or "").strip()
+        if not label or p.get("x") is None or p.get("y") is None:
+            continue
+        try:
+            tx, ty = float(p["x"]) - px, float(p["y"]) - py
+        except (TypeError, ValueError):
+            continue
+        d = math.hypot(tx, ty)
+        if d < 0.05:   # 人物就贴在该陈设上（坐在椅子/床沿），朝向锚无意义
+            continue
+        ang = math.degrees(math.acos(max(-1.0, min(1.0, (pfx * tx + pfy * ty) / d))))
+        if ang > 55:
+            continue
+        cand = (ang, 1, label, in_view(float(p["x"]), float(p["y"])))
+        if best is None or cand[0] < best[0] - 5 or (abs(cand[0] - best[0]) <= 5 and cand[1] > best[1]):
+            best = cand
+    for c in (plot.get("characters") or []):
+        nm = str(c.get("name") or "").strip()
+        if not nm or nm == self_name or c.get("x") is None or c.get("y") is None:
+            continue
+        try:
+            tx, ty = float(c["x"]) - px, float(c["y"]) - py
+        except (TypeError, ValueError):
+            continue
+        d = math.hypot(tx, ty)
+        if d < 0.02:
+            continue
+        ang = math.degrees(math.acos(max(-1.0, min(1.0, (pfx * tx + pfy * ty) / d))))
+        if ang > 45:
+            continue
+        cand = (ang, 0, nm, in_view(float(c["x"]), float(c["y"])))
+        if best is None or cand[0] < best[0] - 5 or (abs(cand[0] - best[0]) <= 5 and cand[1] > best[1]):
+            best = cand
+    if not best:
+        return ""
+    _, is_prop, label, iv = best
+    if is_prop:
+        return f"面朝「{label}」" + ("" if iv else "（该目标在本画面之外，他正朝画面外看）")
+    return f"面朝「{label}」（正对着他/她）" + ("" if iv else "（该目标在本画面之外）")
+
+
 def compute_camera_facts(plot: dict) -> dict:
     """【唯一几何真相源】把调度图坐标一次性算成机位视野的结构化事实。
     机位视野摘要、坐标翻译、AI 镜头翻译全部从这里取数——只算一次、口径只有一套，
@@ -1267,6 +1756,16 @@ def compute_camera_facts(plot: dict) -> dict:
         dist = math.hypot(vx, vy)
         pf = float(c.get("facing") or 0) % 360
         facing_desc = _facing_relative_to_camera(pf, vx, vy, dist, rad)
+        # 场景内朝向锚点：面朝「门」/面朝「某人」优先于镜头相对朝向（压模型的"正脸朝观众"先验）
+        _fa = _facing_scene_anchor(plot, px, py, pf, name, cam)
+        if _fa:
+            try:
+                _tgt = _fa.split("「")[1].split("」")[0]
+                facing_desc = facing_desc.replace("正脸朝向观众", f"正脸朝向「{_tgt}」") \
+                                         .replace("脸大部分朝向观众", f"脸大部分朝向「{_tgt}」")
+            except Exception:
+                pass
+            facing_desc = f"{_fa}，{facing_desc}"
         if dist < 1e-6:
             hidden.append({"name": name, "reason": "就站在机位上（视角人物，镜头从他眼中拍出）",
                            "facing_desc": facing_desc, "side": "", "plan_dir": "", "angle": 0.0})
@@ -1343,6 +1842,76 @@ def _camera_view_summary(plot: dict) -> str:
     return "".join(lines)
 
 
+_INDOOR_MARK = re.compile(r"屋内|屋里|室内|殿内|帐内|舱内|房内|堂内|洞内|宫内|府内|店内|馆内|轿内|船上|织机|灶|炕")
+_OUTDOOR_MARK = re.compile(r"屋外|室外|庭院|院中|院里|旷野|山野|草原|沙漠|街上|街头|城头|城楼|桥上|田野|田间|林中|江边|湖边|海边|雪地")
+
+# FACS AU 编码（AU4 / AU4+AU20+AU7 / AU1、AU7、AU4）是给表格和速查用的，
+# 生图/生视频模型不认识这些 token，混在正文里只会干扰画面（实测会把脸画扭曲）。
+# 发出去之前一律剥掉，情绪语义由紧挨着的中文词（焦急/强忍/震惊…）承担。
+_AU_CODE_RE = re.compile(r"[（(]?\s*AU\s*\d+\s*(?:[+＋、,，/＆&]\s*AU\s*\d+\s*)*[)）]?", re.I)
+
+
+def _clean_au_codes(text: str) -> str:
+    """剥掉提示词里的 FACS AU 编码并清理被剥空的标点/空格。"""
+    if not text or "AU" not in text.upper():
+        return text
+    out = _AU_CODE_RE.sub("", text)
+    # 剥完后可能留下 \"，。，\" \"（）\" 这类空壳或连续标点，压一遍
+    out = re.sub(r"[，,；;、]{2,}", "，", out)
+    out = re.sub(r"（\s*）|\(\s*\)", "", out)
+    out = re.sub(r"[ \t]{2,}", " ", out)
+    out = re.sub(r"\s+([，。；、！？])", r"\1", out)
+    return out.strip()
+
+
+# ---------- 角色设定图提示词 → 纯外貌摘要 ----------
+# 角色的 image_prompt 是"画一张角色设定图"用的：里面必然包含单人全身立绘、正面站姿、
+# 目视镜头、纯色浅背景、柔和均匀打光、8K/电影级景深这类**设定图专用**要求。
+# 把这段原样当"外貌锚点"塞给分镜生图，模型会照着画成纯色背景的立绘/证件照，
+# 而不是分镜画面——这是分镜崩坏最主要的一条。这里按分句过滤：
+# 只要外貌与服装（年龄/脸/发/眼/眉/身形/肤色/衣/甲/饰…），丢掉构图与画质类描述。
+_PORTRAIT_NOISE = re.compile(
+    r"立绘|全身|半身|完整入画|入画|头顶到脚踝|脚踝|四分之三|正面|侧面|背面|朝向|"
+    r"纯色|背景|打光|布光|站姿|坐姿|姿态|目视|看镜头|正视|构图|取景|画幅|画布|"
+    r"超高清|高清|分辨率|像素|电影级|景深|颗粒|体积光|质感|渲染|卡通化|写实|画风|风格|色调|色系|"
+    r"光照|光源|明暗|对比度|饱和度|曝光|镜头|焦段|视角|机位|版式|竖版|横版|比例|留白|居中|对称|"
+    r"细节丰富|细节拉满|清晰|锐利|干净|柔和|均匀|一致|统一|高质量|杰作"
+)
+_PORTRAIT_KEEP = re.compile(
+    r"岁|年龄|女子|男子|少女|少年|青年|中年|老年|孩童|"
+    r"脸|面|发|髻|辫|胡|须|眼|眉|鼻|唇|齿|瞳|肤|额|颧|下巴|颈|耳|"
+    r"身|高|体|肩|腰|腿|臂|手|脚|指|"
+    r"穿|着|衣|裙|裤|衫|襦|袄|袍|褂|甲|铠|胄|鞋|靴|袜|帽|冠|巾|披|斗篷|带|腰带|饰|簪|佩|挂|纹样|布料|麻|丝|棉|皮"
+)
+# 服装/配饰类词：判定"这段分句讲的是穿什么"，正文已写明服装时用它把锚点里的服装剔掉
+_OUTFIT_WORD = re.compile(
+    r"穿|身着|上着|下着|下穿|外罩|内穿|衣|裙|裤|衫|襦|袄|袍|褂|甲|铠|胄|短褐|鞋|靴|袜|帽|冠|"
+    r"头巾|布巾|腰带|系带|绳带|披风|斗篷|短刀|佩|挂|护身符|饰"
+)
+
+
+def _portrait_only(text: str, keep_outfit: bool = True) -> str:
+    """从设定图提示词里只取外貌与服装分句，丢掉构图/站姿/背景/画质类要求。
+    keep_outfit=False 时连服装分句一起去掉——分镜正文已经写明了穿什么的时候，
+    锚点里再写另一套（角色卡常是铠甲造型）就会跟正文打架，模型随机挑一套画。"""
+    s = (text or "").strip()
+    if not s:
+        return ""
+    parts = re.split(r"(?<=[，。；、,;])", s)
+    keep = []
+    for p in parts:
+        t = p.strip(" \t，。；、,;")
+        if not t:
+            continue
+        if _PORTRAIT_NOISE.search(t) or not _PORTRAIT_KEEP.search(t):
+            continue
+        if not keep_outfit and _OUTFIT_WORD.search(t):
+            continue
+        keep.append(t)
+    out = "，".join(keep)
+    return out[:220]
+
+
 def _visible_character_names(plot: dict) -> list[str] | None:
     """按机位几何计算本镜头"入画人物名单"（取自唯一真相源 compute_camera_facts）。
     无有效 plot 数据时返回 None（表示不过滤）。视角人物（站在机位上）不入画。"""
@@ -1365,14 +1934,17 @@ def _facing_relative_to_camera(pf: float, vx: float, vy: float, dist: float, cam
     pfx, pfy = math.sin(prad), -math.cos(prad)  # 人物面朝方向（图纸坐标）
     to_cam = (-vx / dist, -vy / dist)           # 人物→机位方向（看向镜头的方向）
     dot = pfx * to_cam[0] + pfy * to_cam[1]
+    # 带上具体偏差角度：六档量化之内还有细微差别（偏5°和偏30°同属一档，
+    # 但画面上一个是几乎正脸、一个接近侧脸），模型按角度画得更准
+    _a = math.degrees(math.acos(max(-1.0, min(1.0, dot))))  # 与"看向镜头"方向的夹角
     if dot >= 0.82:      # 与视线夹角 ≤ 约35°
-        return "正面对镜头（正脸朝向观众，脸完整可见）"
+        return f"正面对镜头（正脸朝向观众，脸完整可见，视线与镜头方向仅偏约{int(_a)}°）"
     if dot >= 0.45:      # 约35°~63°
-        return "四分之三面向镜头（斜侧身，脸大部分朝向观众、双眼可见）"
+        return f"四分之三面向镜头（斜侧身，脸大部分朝向观众、双眼可见，视线与镜头方向偏约{int(_a)}°——度数越小越接近正脸）"
     if dot <= -0.82:     # 背离视线 ≤ 约35°
-        return "完全背对镜头（只见后脑勺与后背，脸完全不可见）"
+        return f"完全背对镜头（只见后脑勺与后背，脸完全不可见，背离镜头视线约{int(180 - _a)}°）"
     if dot <= -0.45:     # 背离视线 约35°~63°
-        return "四分之三背对镜头（大半背影，脸部几乎不可见）"
+        return f"四分之三背对镜头（大半背影，脸部几乎不可见，背离镜头视线约{int(180 - _a)}°——度数越小越接近完全背影）"
     # 侧对：机位视线右侧在图纸上的方向向量（rad=0 朝上拍时=图纸右方 (1,0)）
     rx, ry = math.cos(cam_rad), math.sin(cam_rad)
     side_dot = pfx * rx + pfy * ry
@@ -1390,9 +1962,17 @@ _FACING_VISUAL_RULE = [
 
 
 def _facing_rule_text(facing_desc: str) -> str:
-    """朝向描述 → 对应的硬性视觉要求短语（提示词里逐人跟在朝向后，压权重）。"""
+    """朝向描述 → 对应的硬性视觉要求短语（提示词里逐人跟在朝向后，压权重）。
+    描述里带场景内面朝锚点（面朝「门」）时，"朝向观众"一律改成朝向该目标——
+    否则档位规则（脸朝向观众）与锚点（脸朝门）互相打架，模型随机挑一个（实测漂移根源）。"""
     for key, rule in _FACING_VISUAL_RULE:
         if key in facing_desc:
+            if "面朝「" in facing_desc:
+                try:
+                    tgt = facing_desc.split("面朝「", 1)[1].split("」", 1)[0]
+                    rule = rule.replace("双眼朝向观众", f"双眼朝向「{tgt}」").replace("脸大部分朝向观众", f"脸大部分朝向「{tgt}」")
+                except Exception:
+                    pass
             return rule
     return "按写明的朝向执行"
 
@@ -1401,6 +1981,223 @@ def _facing_brief(desc: str) -> str:
     """朝向描述去掉括号内补充说明（硬约束行里已有视觉要求，避免双重括号重复）。"""
     i = desc.find("（")
     return desc[:i] if i > 0 else desc
+
+
+def _hidden_props_note(plot: dict) -> str:
+    """机位视野外的门窗/家具黑名单 → 参考图取舍说明。
+    实测教训：场景设定图的参考说明写着"环境、陈设必须与此图一致"，图片的说服力压过
+    提示词文字——调度图里明明把门摆在机位身后（视野外），模型仍从场景设定图把门抄进
+    画面右缘。在场景参考说明里明确"位置取舍以调度图纸为准"并列出视野外陈设黑名单。"""
+    import math
+    cam = plot.get("camera") or {}
+    if not isinstance(cam, dict) or "x" not in cam:
+        return ""
+    cx, cy = float(cam.get("x", 0.5)), float(cam.get("y", 0.95))
+    rad = math.radians(float(cam.get("facing") or 0) % 360)
+    fx, fy = math.sin(rad), -math.cos(rad)
+    fov = float(cam.get("fov") or 55)
+    hidden = []
+    for p in (plot.get("props") or []):
+        label = str(p.get("label") or p.get("name") or "").strip()
+        if not label or not isinstance(p.get("x"), (int, float)):
+            continue
+        vx, vy = float(p["x"]) - cx, float(p["y"]) - cy
+        dist = math.hypot(vx, vy)
+        if dist < 1e-6:
+            hidden.append(label)
+            continue
+        depth = vx * fx + vy * fy
+        try:
+            angle = math.degrees(math.acos(max(-1.0, min(1.0, depth / dist))))
+        except ValueError:
+            angle = 180.0
+        if depth <= 0 or dist <= 0.15 or angle > fov / 2 + 25:
+            hidden.append(label)
+    if not hidden:
+        return ""
+    return ("【陈设取舍·权威】以下陈设在本镜机位视野之外，画面中严禁出现（即使场景设定图里有也必须删掉）："
+            + "、".join(f"「{h}」" for h in hidden)
+            + "。场景设定图只提供材质、样式与光线氛围参考；所有陈设的画面位置与取舍一律以调度图纸机位几何为准，"
+              "两者冲突时以调度图纸为准。")
+
+
+def _prop_frame_lines(plot: dict) -> str:
+    """把门窗/家具陈设按机位几何翻译成"画面落位"（借鉴 compute_camera_facts 的人物口径）：
+    画面左右按「站在机位处朝拍摄方向看」换算（机位视线左侧＝画面左侧，与图纸方位无关），
+    按沿视线投影深度排远近，视野外/机位身后的陈设明确标不入画。
+    2D 原始逻辑只翻译陈设朝向（format_plot_to_prompt 的陈设朝向行），这里补落位——
+    门窗/大件家具在画面中的位置直接决定构图，实测模型自己换算不了。"""
+    import math
+    cam = plot.get("camera") or {}
+    if not isinstance(cam, dict) or "x" not in cam:
+        return ""
+    cx, cy = float(cam.get("x", 0.5)), float(cam.get("y", 0.95))
+    facing = float(cam.get("facing") or 0) % 360
+    fov = float(cam.get("fov") or 55)
+    rad = math.radians(facing)
+    fx, fy = math.sin(rad), -math.cos(rad)
+    items = []
+    for p in (plot.get("props") or []):
+        label = str(p.get("label") or p.get("name") or "").strip()
+        if not label or not isinstance(p.get("x"), (int, float)):
+            continue
+        px, py = float(p["x"]), float(p["y"])
+        vx, vy = px - cx, py - cy
+        dist = math.hypot(vx, vy)
+        if dist < 1e-6:
+            continue
+        depth = vx * fx + vy * fy
+        dot_norm = depth / dist
+        angle = math.degrees(math.acos(max(-1.0, min(1.0, dot_norm))))
+        cross = fx * vy - fy * vx
+        if depth <= 0:
+            items.append((depth, f"「{label}」在机位身后（不出现在画面中）"))
+        elif dist <= 0.15:
+            items.append((depth, f"「{label}」紧贴机位（就在镜头旁边，基本不入画）"))
+        elif angle > fov / 2 + 25:
+            items.append((depth, f"「{label}」在机位视野范围之外（不出现在画面中）"))
+        else:
+            side = _frame_side_text(cross, dist, fov)
+            edge = "、靠近视野边缘可能被画面裁切" if angle > fov / 2 + 10 else ""
+            items.append((depth, f"「{label}」在画面中的{side}{edge}"))
+    if not items:
+        return ""
+    items.sort(key=lambda t: t[0])   # 按投影深度升序＝从近到远
+    n = len(items)
+    out = []
+    for i, (_, txt) in enumerate(items):
+        # 视野内的才标远近序次（出画的标远近没有意义）
+        if "不出现在画面中" in txt or "基本不入画" in txt:
+            out.append(txt)
+        else:
+            rank = "离镜头最近" if i == 0 else ("离镜头最远" if i == n - 1 else f"离镜头第{i + 1}近")
+            out.append(txt.replace("在画面中的", f"（{rank}）在画面中的"))
+    return ("【陈设落位·机位相对】门窗/家具等陈设在画面中的左右与远近已按机位朝向换算"
+            "（机位视线左侧＝画面左侧，与图纸方位无关），人物动作与陈设的相对位置据此执行："
+            + "；".join(out) + "。")
+
+
+def _char_prop_relations(plot: dict, facts: dict) -> str:
+    """人物与视野内大件陈设（织布机/门/衣柜等）的前后关系，逐人说破。
+    实测教训："木兰在织布机前面"这类空间关系靠模型从各自独立的落位描述里自己推，
+    十有八九漂移（人画到陈设后面/穿模）。直接把谁在谁的靠镜头一侧写成权威事实。"""
+    import math
+    cam = plot.get("camera") or {}
+    if not isinstance(cam, dict) or "x" not in cam:
+        return ""
+    cx, cy = float(cam.get("x", 0.5)), float(cam.get("y", 0.95))
+    rad = math.radians(float(cam.get("facing") or 0) % 360)
+    fx, fy = math.sin(rad), -math.cos(rad)
+    fov = float(cam.get("fov") or 55)
+    # 视野内陈设的投影深度（与 _prop_frame_lines 同一套口径）
+    props_vis = []
+    for p in (plot.get("props") or []):
+        label = str(p.get("label") or p.get("name") or "").strip()
+        if not label or not isinstance(p.get("x"), (int, float)):
+            continue
+        vx, vy = float(p["x"]) - cx, float(p["y"]) - cy
+        dist = math.hypot(vx, vy)
+        if dist < 1e-6:
+            continue
+        depth = vx * fx + vy * fy
+        try:
+            angle = math.degrees(math.acos(max(-1.0, min(1.0, depth / dist))))
+        except ValueError:
+            continue
+        if depth > 0 and angle <= fov / 2 + 25:
+            props_vis.append((label, depth))
+    if not props_vis:
+        return ""
+    lines = []
+    for c in facts["visible"]:
+        cd = c["depth"]
+        near = [lbl for lbl, d in props_vis if cd < d]    # 人物比陈设更近镜头
+        far = [lbl for lbl, d in props_vis if cd >= d]    # 陈设比人物更近镜头
+        seg = []
+        for lbl in near[:2]:
+            seg.append(f"{c['name']}在「{lbl}」靠镜头一侧（{lbl}在{c['name']}身后）")
+        for lbl in far[:2]:
+            seg.append(f"{c['name']}在「{lbl}」远离镜头一侧（{lbl}在{c['name']}与镜头之间）")
+        if seg:
+            lines.append("；".join(seg))
+    if not lines:
+        return ""
+    return ("【人物与陈设前后关系·权威】" + "；".join(lines) + "。"
+            "前后遮挡关系按此执行：靠镜头一侧的人物画在陈设前面（陈设被人物部分遮挡或位于其身后），"
+            "严禁把人物画到陈设后面去。")
+
+
+def _spatial_lock_lines(plot: dict, facts: dict) -> str:
+    """空间大小比例关系全量锁定（米制）。图纸 0-1 归一化坐标按房间真实尺寸（plot.room，
+    缺省 10×10 米）换算（与 3D 导演台同一换算）。人物间距、人物与陈设距离、
+    人物离墙距离、陈设占地尺寸全部换算成米写进提示词——这些比例是权威事实，
+    生图模型不得自行压缩或夸大空间，画面中的大小/间距/离墙比例按米数与透视执行。"""
+    import math
+    rw, rh = _room_dims(plot)
+    cam = plot.get("camera") or {}
+    if not isinstance(cam, dict) or "x" not in cam:
+        return ""
+    rad = math.radians(float(cam.get("facing") or 0) % 360)
+    fx, fy = math.sin(rad), -math.cos(rad)
+    fov = float(cam.get("fov") or 55)
+    cx, cy = float(cam.get("x", 0.5)), float(cam.get("y", 0.95))
+
+    def _in_view(px, py):
+        vx, vy = px - cx, py - cy
+        dist = math.hypot(vx, vy)
+        if dist < 1e-6:
+            return False
+        depth = vx * fx + vy * fy
+        try:
+            angle = math.degrees(math.acos(max(-1.0, min(1.0, depth / dist))))
+        except ValueError:
+            return False
+        return depth > 0 and angle <= fov / 2 + 25
+
+    chars = [c for c in facts["visible"]]
+    props_vis = [(str(p.get("label") or p.get("name") or "").strip(), float(p["x"]), float(p["y"]),
+                  float(p.get("w") or 0.15), float(p.get("h") or 0.15))
+                 for p in (plot.get("props") or [])
+                 if isinstance(p.get("x"), (int, float)) and str(p.get("label") or p.get("name") or "").strip()
+                 and _in_view(float(p["x"]), float(p["y"]))]
+    if not chars and not props_vis:
+        return ""
+    lines = []
+    for c in chars:
+        px, py = float(c.get("_x", 0)) if False else 0, 0   # placeholder（不用）
+    # 人物相关：间距/离陈设/离墙（facts.visible 没带坐标，从 plot 反查）
+    char_xy = []
+    for c in (plot.get("characters") or []):
+        name = str(c.get("name") or "").strip()
+        if not name or not isinstance(c.get("x"), (int, float)):
+            continue
+        if any(v["name"] == name for v in facts["visible"]):
+            char_xy.append((name, float(c["x"]), float(c["y"])))
+    for name, px, py in char_xy:
+        seg = []
+        for oname, ox, oy in char_xy:
+            if oname == name:
+                continue
+            d = math.hypot((px - ox) * rw, (py - oy) * rh)
+            seg.append(f"与{oname}相距约{d:.1f}米")
+        for lbl, ox, oy, _w, _h in props_vis:
+            d = math.hypot((px - ox) * rw, (py - oy) * rh)
+            seg.append(f"离「{lbl}」约{d:.1f}米")
+        # 离墙：左(px*rw)、右((1-px)*rw)、空间深处(py*rh)、镜头侧((1-py)*rh)，取最近的一堵
+        walls = [("左墙", px * rw), ("右墙", (1 - px) * rw), ("空间深处的墙", py * rh), ("镜头侧的墙", (1 - py) * rh)]
+        wn, wd = min(walls, key=lambda t: t[1])
+        seg.append(f"离{wn}约{wd:.1f}米")
+        if seg:
+            lines.append(f"{name}：" + "、".join(seg))
+    for lbl, _ox, _oy, w, h in props_vis:
+        lines.append(f"「{lbl}」占地约{w * rw:.1f}米×{h * rh:.1f}米")
+    if not lines:
+        return ""
+    return (f"【空间比例锁定·米制（权威）】图纸整个平面＝{rw:g}米×{rh:g}米的真实空间（下同，所有距离均为真实米数，"
+            "人物身高按约1.7米等比换算）：\n- " + "\n- ".join(lines) +
+            "\n画面中人物之间、人物与陈设的相对大小与间距比例，人物在空间里的宽窄远近关系，严格按上述米数与近大远小透视执行："
+            "间距近的必须画得贴近，间距远的必须拉开距离；陈设占地大的画大、占地小的画小；"
+            "不得压缩或夸大空间，不得为了让人物显眼而改变真实比例关系。")
 
 
 def format_plot_to_prompt(plot: dict, dynamic: bool = False) -> str:
@@ -1427,6 +2224,29 @@ def format_plot_to_prompt(plot: dict, dynamic: bool = False) -> str:
     if cam.get("pitch_rule"):
         lines.append("【镜头夹角·俯仰】" + cam["pitch_rule"])
 
+    # 陈设朝向（导演在 3D 导演台转过朝向的建筑/道具）：门/床/柜朝哪直接影响画面构图
+    _DIR8 = ["图纸上方", "右上", "图纸右方", "右下", "图纸下方", "左下", "图纸左方", "左上"]
+    prop_dirs = []
+    for p in (plot.get("props") or []):
+        f = float(p.get("facing") or 0)
+        if f % 360 < 1:
+            continue   # 未转过的默认朝向不占提示词篇幅
+        prop_dirs.append(f"「{p.get('label')}」开口/正面朝{_DIR8[int(((f % 360) + 22.5) // 45) % 8]}")
+    if prop_dirs:
+        lines.append("【陈设朝向】" + "；".join(prop_dirs) + "（方位＝俯视图纸上的方位，不是画面左右）。")
+    # 陈设落位：门窗/家具在画面中的左右与远近按机位几何换算（与人物同一套口径）
+    _pf = _prop_frame_lines(plot)
+    if _pf:
+        lines.append(_pf)
+    # 人物与陈设前后关系："木兰在织布机前面"直接说破，不靠模型自己推（实测必漂）
+    _rel = _char_prop_relations(plot, facts)
+    if _rel:
+        lines.append(_rel)
+    # 空间比例锁定：人物间距/离陈设/离墙/陈设占地全部换算成米，禁止模型自行压缩或夸大空间
+    _sp = _spatial_lock_lines(plot, facts)
+    if _sp:
+        lines.append(_sp)
+
     # 人物站位：程序直译（从近到远）。远近与大小按沿视线投影深度（透视成像 ∝ 1/深度）
     n = max(len(facts["visible"]) - 1, 1)
     seg = []
@@ -1447,8 +2267,12 @@ def format_plot_to_prompt(plot: dict, dynamic: bool = False) -> str:
         # 朝向单独成行、逐人硬约束（与 AI 镜头解读的强化保持一致；兜底路径同样不能弱）
         fr = "；".join(f"{c['name']}＝{_facing_brief(c['facing_desc'])}（{_facing_rule_text(c['facing_desc'])}）" for c in facts["visible"])
         lines.append("【人物朝向·逐人硬约束】" + fr + "。朝向是权威事实，与任何文字描述冲突时以本条为准。")
+        lines.append("【图纸外群演】提示词正文明确写到、但图纸没有摆放的人物（宫人、侍卫、宾客等群演配角）按正文入画："
+                     "安排在背景或正文指定的位置即可，不挤占名单人物的站位与景别，人数与正文一致；"
+                     "正文没写的无名人影一律不画。")
     else:
-        lines.append("【人物站位】机位前方视野内没有人物，画面以环境空镜为主。")
+        lines.append("【人物站位】机位前方视野内没有图纸人物：画面环境与人物以文字提示词为准；"
+                     "提示词正文写到的人物（宫人、路人甲等群演）按正文入画，安排在画面中部或背景即可。")
     hidden = facts["hidden"]
     if hidden:
         if dynamic:
@@ -1470,16 +2294,16 @@ def format_plot_to_prompt(plot: dict, dynamic: bool = False) -> str:
                      "以上两个名单描述的都是0秒初始画面的状态，不约束后续：初始在画面里的人物按上述站位出现；"
                      "初始不在画面的人物，若走位或镜头运动使其进入机位视野，则按真实透视自然走入画面（入画的就是本人，从画面边缘进来），"
                      "始终未进入视野的则全程不得出现、严禁凭空冒出。人物进出场只以走位与镜头运动为准。"
-                     "每个人物的身体朝向按名单描述逐人严格执行：正面对镜头＝正脸朝向观众；四分之三面向镜头＝斜侧身、脸大部分朝向观众；侧对镜头＝只露写明的那一侧侧脸；四分之三背对镜头＝大半背影、脸部几乎不可见；完全背对镜头＝只见后脑勺与后背、严禁画出脸。"
+                     "每个人物的身体朝向按名单描述逐人严格执行：正面对镜头＝正脸朝向其被指定的面朝目标（未指定目标时才是朝向镜头）；四分之三面向镜头＝斜侧身、脸大部分朝向其面朝目标；侧对镜头＝只露写明的那一侧侧脸；四分之三背对镜头＝大半背影、脸部几乎不可见；完全背对镜头＝只见后脑勺与后背、严禁画出脸。被指定了面朝目标（如面朝「门」）的人，脸与身体一律朝着该目标，严禁为了让观众看清脸而擅自转向镜头。"
                      "每个角色在画面中只出现一次、只有一个身体：走位描述的是同一角色的位移，严禁画成分身、复制人或两个同名角色；"
                      "俯视调度图纸/轨迹图类参考图仅用于确定站位与走位，严禁把图纸、人偶棋子图标、扇形视锥画进画面。")
     else:
         lines.append("【透视规则】离机位越近的人画面里越大（可为前景，可能只露腿部/肩膀/背影），越远越小、靠近地平线；"
                      "站在同一纵深位置的人物身高一致，纵深远近带来的高矮差异必须画出来；"
-                     "每个人物的身体朝向以上述描述为准、逐人严格执行：正面对镜头＝正脸朝向观众；四分之三面向镜头＝斜侧身、脸大部分朝向观众；侧对镜头＝只露写明的那一侧侧脸；四分之三背对镜头＝大半背影、脸部几乎不可见；完全背对镜头＝只见后脑勺与后背、严禁画出脸。"
+                     "每个人物的身体朝向以上述描述为准、逐人严格执行：正面对镜头＝正脸朝向其被指定的面朝目标（未指定目标时才是朝向镜头）；四分之三面向镜头＝斜侧身、脸大部分朝向其面朝目标；侧对镜头＝只露写明的那一侧侧脸；四分之三背对镜头＝大半背影、脸部几乎不可见；完全背对镜头＝只见后脑勺与后背、严禁画出脸。被指定了面朝目标（如面朝「门」）的人，脸与身体一律朝着该目标，严禁为了让观众看清脸而擅自转向镜头；角色设定图里的正面站姿只锁外貌与服装，不决定本镜朝向。"
                      "文字提示词中的朝向描述（如'面朝XX方向''看画面的对侧''望向XX'）若与本名单冲突，一律作废、按本名单执行。"
                      "镜头就是对准入画名单里的人拍的：离镜头最近的主体应按景别呈现在镜头前方（构图围绕该主体），"
-                     "写'正面对镜头/四分之三面向镜头'的主体必须让脸朝向观众，严禁把他挪到画面边缘、画成背身、或把画面取成顺着他视线望出去的方向。"
+                     "写'正面对镜头/四分之三面向镜头'的主体必须让脸朝向他被指定的面朝目标（面朝「门」就看着门；未指定目标时才朝向观众），严禁把他挪到画面边缘、画成背身、或把画面取成顺着他视线望出去的方向。"
                      "上面两个名单由程序按坐标计算，是权威事实："
                      "绝不入画名单里的人禁止出现在画面中，即使文字提示词提到了他们。"
                      "每个角色在画面中只出现一次、只有一个身体：走位描述的是同一角色的位移，严禁画成分身、复制人或两个同名角色；"
@@ -1578,7 +2402,7 @@ def format_plot_to_prompt(plot: dict, dynamic: bool = False) -> str:
 _SHOT_BRIEF_CACHE: dict[str, dict] = {}   # key = sha1(plot+画面描述+dynamic) → 校验后的 brief JSON
 
 SHOT_TRANSLATE_SYSTEM_PROMPT = """你是资深摄影指导兼镜头翻译官。输入有两部分：
-①调度图纸的坐标数据（俯视图，0-1 归一化坐标：x 右为正、y 下为正；camera=机位位置/朝向/视锥，facing 0=图纸上方、90=右方、180=下方、270=左方；characters=人物位置/朝向/轨迹；props=陈设）；
+①调度图纸的坐标数据（俯视图，0-1 归一化坐标：x 右为正、y 下为正；camera=机位位置/朝向/视锥，facing 0=图纸上方、90=右方、180=下方、270=左方；characters=人物位置/朝向/轨迹；props=陈设，含朝向 facing：0=图纸上方、顺时针，如门/床/柜的开口朝向）；
 ②程序按坐标算好的机位几何事实（visible=入画名单已按离镜头由近到远排序，含每人的 depth_rank 近远次序、size_percent 画面大小百分比、frame_side 画面左右、facing 身体朝向、near_edge 是否贴近视野边缘；hidden=绝不入画名单）。
 
 几何事实是权威，不可更改：谁入画谁不入画、近远次序、大小百分比、画面左右、身体朝向一律照抄，禁止用你的直觉重算或调换。
@@ -1607,7 +2431,7 @@ async def synthesize_shot_brief(plot: dict, scene_desc: str, dynamic: bool) -> d
         return None
     try:
         key = hashlib.sha1(json.dumps(
-            {"plot": plot, "desc": (scene_desc or "")[:500], "dyn": bool(dynamic), "v": 2},
+            {"plot": plot, "desc": (scene_desc or "")[:500], "dyn": bool(dynamic), "v": 3},
             sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
     except Exception:
         return None
@@ -1629,7 +2453,8 @@ async def synthesize_shot_brief(plot: dict, scene_desc: str, dynamic: bool) -> d
                                  if isinstance(p, (list, tuple)) and len(p) >= 2]}
                        for c in plot.get("characters") or []],
         "props": [{"name": str(p.get("name") or "")[:20],
-                   "x": round(float(p.get("x") or 0), 3), "y": round(float(p.get("y") or 0), 3)}
+                  "x": round(float(p.get("x") or 0), 3), "y": round(float(p.get("y") or 0), 3),
+                  "facing": round(float(p.get("facing") or 0), 0)}
                   for p in (plot.get("props") or [])[:12]],
     }
     facts_txt = {
@@ -1770,6 +2595,9 @@ def render_shot_brief_text(brief: dict) -> str:
         # 朝向单独成行、逐人给出硬性视觉要求——埋在括号列表里权重太低，模型实测会忽略
         fr = "；".join(f"{c['name']}＝{_facing_brief(c['facing'])}（{_facing_rule_text(c['facing'])}）" for c in chars)
         lines.append("【人物朝向·逐人硬约束】" + fr + "。朝向是权威事实，与任何文字描述冲突时以本条为准。")
+        lines.append("【图纸外群演】提示词正文明确写到、但图纸没有摆放的人物（宫人、侍卫、宾客等群演配角）按正文入画："
+                     "安排在背景或正文指定的位置即可，不挤占名单人物的站位与景别，人数与正文一致；"
+                     "正文没写的无名人影一律不画。")
     excluded = brief.get("excluded") or []
     if excluded:
         lines.append("绝不入画：" + "；".join(f"{c['name']}（{c['reason']}）" for c in excluded) + "。")
@@ -1783,6 +2611,18 @@ async def build_plot_prompt_text(plot: dict, scene_desc: str, dynamic: bool = Fa
     brief = await synthesize_shot_brief(plot or {}, scene_desc, dynamic)
     if brief:
         text = render_shot_brief_text(brief)
+        # AI 翻译只覆盖人物（入画名单/落位/朝向），门窗家具的画面落位由程序按机位几何直译补充
+        _pf = _prop_frame_lines(plot or {})
+        if _pf:
+            text += _pf + "\n"
+        # 人物与织布机等大件陈设的前后关系也说破（AI 翻译不输出这类相对关系）
+        _rel = _char_prop_relations(plot or {}, compute_camera_facts(plot or {}))
+        if _rel:
+            text += _rel + "\n"
+        # 空间比例锁定（米制）：人物间距/离陈设/离墙/陈设占地全部写成米数
+        _sp = _spatial_lock_lines(plot or {}, compute_camera_facts(plot or {}))
+        if _sp:
+            text += _sp + "\n"
         # 轨迹/走位仍由程序直译补充（AI 只管初始帧画面语言；运动路线公式简单稳定，无需 AI）
         det = format_plot_to_prompt(plot or {}, dynamic=dynamic)
         det_moves = ""
@@ -1849,7 +2689,8 @@ def render_diagram_png(plot: dict, kind: str) -> bytes:
     d.text((M, 18), ("轨迹调度图 · 运动轨迹与机位移动（正上方俯视平面图）" if is_traj
                      else "俯视调度图 · 人物位置与机位（正上方俯视平面图）"),
            fill="#1f2937", font=f_title)
-    d.text((W - M, 30), "上=空间远端  下=空间近端", fill="#9ca3af", font=f_small, anchor="ra")
+    _rw, _rh = _room_dims(plot)
+    d.text((W - M, 30), f"上=空间远端  下=空间近端  房间约{_rw:g}米×{_rh:g}米", fill="#9ca3af", font=f_small, anchor="ra")
 
     # 场景地面边框 + 网格
     d.rounded_rectangle([FX0, FY0, FX0 + FW, FY0 + FH], radius=18, outline="#374151", width=5)
@@ -1889,13 +2730,21 @@ def render_diagram_png(plot: dict, kind: str) -> bytes:
         rad = math.radians(facing)
         return (x + length * math.sin(rad), y - length * math.cos(rad))
 
-    # 陈设
+    # 陈设（facing：0=朝图纸上方、顺时针，与人物/机位同一约定；0 时退化为轴对齐矩形）
     for p in plot.get("props") or []:
         px, py = P(p["x"], p["y"])
         pw, ph = FW * p["w"], FH * p["h"]
-        d.rectangle([px - pw / 2, py - ph / 2, px + pw / 2, py + ph / 2],
-                    fill="#eef1f5", outline="#8a93a3", width=3)
-        d.text((px, py - ph / 2 - 16), p["label"], fill="#6b7280", font=f_tag, anchor="mm")
+        rad = math.radians(float(p.get("facing") or 0))
+        # 局部坐标 → 图像偏移：正面法向（u，深度方向）=(sin, -cos)，右向（v，宽度方向）=(cos, sin)
+        # 与 facing_xy 同一约定，保证 2D 图纸与 3D 导演台转出来的朝向一致
+        corners = []
+        for u, v in ((-ph / 2, -pw / 2), (-ph / 2, pw / 2), (ph / 2, pw / 2), (ph / 2, -pw / 2)):
+            corners.append((px + u * math.sin(rad) + v * math.cos(rad),
+                            py + u * (-math.cos(rad)) + v * math.sin(rad)))
+        d.polygon(corners, fill="#eef1f5")
+        d.line(corners + [corners[0]], fill="#8a93a3", width=3, joint="curve")
+        top_off = abs(math.cos(rad)) * ph / 2 + abs(math.sin(rad)) * pw / 2
+        d.text((px, py - top_off - 14), p["label"], fill="#6b7280", font=f_tag, anchor="mm")
 
     # 角色轨迹（先画线，再画人偶，线在人偶下方）——只在轨迹图模式画；
     # 俯视图（站位机位）只看位置与朝向，画轨迹线会与轨迹图重复、显得杂乱（用户反馈）
@@ -2218,7 +3067,7 @@ STAGING_SYSTEM_PROMPT = """你是场面调度解读员。导演给了一个镜�
    - 离机位近 → 离镜头近 → 画面中显得大、位于画面下缘，可能部分遮挡别人或被取景框裁切（紧挨机位的人可能只露出腿部/肩膀，按真实视野处理）；
    - 离机位远 → 显得小、靠近画面上缘地平线。
    分寸提示：从分镜描述中识别该镜头的景别与画面主体——主体按景别呈现，但主体同样站在调度图给他安排的位置上取景（不要把主体搬到前景）；其余人物的大小由与镜头的真实距离按透视自然形成，身高一致、纵深相近者大小相近，严禁画成巨人或小矮人；相对远近次序不变，与谁在做什么、谁是主角无关。
-3. 左右关系按"站在机位处朝拍摄方向看去"的左右为准；每人朝向必须照抄机位视野事实里的结论（正面对镜头＝正脸朝观众、四分之三面向镜头＝斜侧身脸大部分可见、侧对镜头＝按写明的画面左右侧脸、四分之三背对镜头＝大半背影脸几乎不可见、完全背对镜头＝只见背影严禁画脸），口述里"面朝某人方向"之类的描述只用来理解剧情，与事实冲突时不得写进 brief。
+3. 左右关系按"站在机位处朝拍摄方向看去"的左右为准；每人朝向必须照抄机位视野事实里的结论（若事实里带「面朝『某陈设/某人』」锚点，必须把该锚点写进 brief 并让人物脸朝该目标）：正面对镜头＝正脸朝其面朝目标（未指定目标时朝观众）、四分之三面向镜头＝斜侧身脸大部分朝向其面朝目标、侧对镜头＝按写明的画面左右侧脸、四分之三背对镜头＝大半背影脸几乎不可见、完全背对镜头＝只见背影严禁画脸；被指定面朝目标的人严禁为了露脸而转向镜头。
 4. 写明明显的前后遮挡关系（谁在谁前面）。
 5. 必须写明人物之间的相对间距，保持口述中的比例：谁和谁挨得近（如"小美就在小帅右侧两三步处，两人几乎并排""三人扎堆围在栅栏边"）、谁离人群远（如"瘦猴独自在角落，与人群隔半个画面"）。相近的人在画面中也应相邻、允许互相部分遮挡；不要把人物均匀散布在画面里。
 6. 若有移动轨迹，写明从起点纵深到终点纵深的变化（如"从远景跑向近景，逐渐变大"）。
@@ -2273,6 +3122,194 @@ async def staging_brief(req: StagingBriefRequest):
     log_prompt("调度纵深解读(模板兜底)", fb)
     return {"staging_brief": fb, "source": "template"}
 
+
+# ---------- 2.75 提示词冲突一键检测：输入框提示词 vs 调度图/3D导演台坐标事实 ----------
+# 优先级约定（与产品逻辑一致）：P1 调度图/3D导演台（第一原则，永远获胜）
+#   > P2 导演在输入框手动修改/重写的内容 > P3 AI 自动生成的文本（必要时可舍弃）。
+# 检测是纯规则比对（逐句扫描 vs compute_camera_facts 唯一真相源），不调 AI、毫秒级返回。
+
+class ConflictCheckRequest(BaseModel):
+    prompt: str = ""          # 生图提示词（输入框当前内容）
+    video_prompt: str = ""    # 视频提示词（输入框当前内容）
+    plot_data: dict = {}      # 本镜调度图/3D导演台坐标数据
+
+_FACE_TOWARD_RE = re.compile(r"正面对镜头|面对镜头|面向镜头|朝向镜头|看向镜头|望着镜头|目视镜头|正脸朝观众|朝观众|对准镜头")
+_FACE_AWAY_RE = re.compile(r"背对镜头|背对观众|背影|背身|转过身去|转身背")
+_FACE_SIDE_RE = re.compile(r"侧对镜头|侧脸|侧身(朝|面向|对)")
+_SIDE_LEFT_RE = re.compile(r"画面左|画左|靠左|左侧|左边")
+_SIDE_RIGHT_RE = re.compile(r"画面右|画右|靠右|右侧|右边")
+_PRESENCE_RE = re.compile(r"站|坐|躺|走|跑|跪|趴|蹲|立|出现在|入画|位于|走在|站在")
+
+_CONFLICT_LEGEND = [
+    {"level": "P1", "name": "调度图 / 3D 导演台", "desc": "坐标几何事实，第一原则，永远获胜"},
+    {"level": "P2", "name": "输入框手动修改 / 重写", "desc": "导演手改的内容，第二优先级；与 P1 冲突时会标红提醒，由导演决定改哪边"},
+    {"level": "P3", "name": "AI 自动生成文本", "desc": "必要时可舍弃；与 P1 冲突处建议直接删改"},
+]
+
+
+def _facing_family(desc: str) -> str:
+    """机位几何事实的朝向档位 → 三大家族（toward/away/side），供与正文朝向词比对。"""
+    if "正面对镜头" in desc or "四分之三面向镜头" in desc:
+        return "toward"
+    if "完全背对镜头" in desc or "四分之三背对镜头" in desc:
+        return "away"
+    if "侧对镜头" in desc:
+        return "side"
+    return ""
+
+
+def _claim_family(sentence: str) -> str:
+    """提示词句子里的朝向词 → 三大家族。同时命中多类（如"转身又看向镜头"）时返回空（不判）。"""
+    fams = set()
+    if _FACE_TOWARD_RE.search(sentence):
+        fams.add("toward")
+    if _FACE_AWAY_RE.search(sentence):
+        fams.add("away")
+    if _FACE_SIDE_RE.search(sentence):
+        fams.add("side")
+    if "面朝「" in sentence or "面朝门" in sentence or "朝门" in sentence:
+        fams.add("anchor")   # 正文自己指定了面朝目标，与镜头相对档位不冲突，交给锚点裁决
+    if len(fams) == 1:
+        return fams.pop()
+    return ""
+
+
+def _claim_side(sentence: str) -> str:
+    """句子里写明的画面左右（同时写左右/含'左边和右边'类并列时不判）。"""
+    l, r = bool(_SIDE_LEFT_RE.search(sentence)), bool(_SIDE_RIGHT_RE.search(sentence))
+    if l and not r:
+        return "left"
+    if r and not l:
+        return "right"
+    return ""
+
+
+def _fact_side(side_text: str) -> str:
+    if "画面右" in side_text:
+        return "right"
+    if "画面左" in side_text:
+        return "left"
+    return ""
+
+
+def _prop_view_states(plot: dict) -> list:
+    """每个陈设的机位视野状态：是否入画、画面左右（与 _hidden_props_note 同一套几何口径）。"""
+    import math
+    cam = plot.get("camera") or {}
+    if not isinstance(cam, dict) or "x" not in cam:
+        return []
+    cx, cy = float(cam.get("x", 0.5)), float(cam.get("y", 0.95))
+    rad = math.radians(float(cam.get("facing") or 0) % 360)
+    fx, fy = math.sin(rad), -math.cos(rad)
+    fov = float(cam.get("fov") or 55)
+    out = []
+    for p in (plot.get("props") or []):
+        label = str(p.get("label") or p.get("name") or "").strip()
+        if not label or p.get("x") is None:
+            continue
+        vx, vy = float(p["x"]) - cx, float(p["y"]) - cy
+        dist = math.hypot(vx, vy)
+        if dist < 1e-6:
+            out.append({"label": label, "in_view": False, "side": ""})
+            continue
+        depth = vx * fx + vy * fy
+        angle = math.degrees(math.acos(max(-1.0, min(1.0, depth / dist))))
+        cross = fx * vy - fy * vx
+        ok = depth > 0 and dist > 0.15 and angle <= fov / 2 + 25
+        out.append({"label": label, "in_view": ok,
+                    "side": _frame_side_text(cross, dist, fov) if ok else ""})
+    return out
+
+
+def _scan_prompt_conflicts(scope: str, text: str, plot: dict, facts: dict, dynamic: bool) -> list:
+    """逐句扫描一份提示词，与机位几何事实比对，返回冲突列表。"""
+    results = []
+    s = (text or "").strip()
+    if not s:
+        return results
+    # 段落标签（【画面内容】等）与坐标数据块不参与逐句判定
+    body = re.sub(r"[【\[]([^\]】]{1,60})[\]】]", " ", s)
+    sentences = [x.strip() for x in re.split(r"[。！？；;\n]", body) if len(x.strip()) >= 4]
+    visible = {c["name"]: c for c in facts["visible"]}
+    hidden = {c["name"]: c for c in facts["hidden"]}
+    props = _prop_view_states(plot)
+
+    def add(sev, ctype, found, fact, advice):
+        results.append({"scope": scope, "severity": sev, "type": ctype,
+                        "found": found[:80], "fact": fact[:160], "advice": advice[:160]})
+
+    for sent in sentences:
+        # ① 人物入画冲突：几何判"不入画"的人被正文写成正在画面里（视频动态模式仅提示）
+        for nm, m in hidden.items():
+            if nm not in sent or not _PRESENCE_RE.search(sent):
+                continue
+            if dynamic:
+                add("info", "人物入画（视频·初始帧）", sent,
+                    f"调度图事实：{nm}{m['reason']}，仅不在0秒初始画面内。",
+                    "P1 调度图：初始帧不得出现 TA；若走位/镜头运动把 TA 带入画面则从边缘自然入画。如正文原意如此可忽略。")
+            else:
+                add("high", "人物入画冲突", sent,
+                    f"调度图事实：{nm}{m['reason']}。",
+                    "P1 调度图 > P2 手改：该人物本镜不得入画。若剧情需要其存在，改用画外音/门后影子等手法，或修改调度图。")
+        # ② 人物朝向冲突：正文朝向词与几何档位家族不同
+        for nm, c in visible.items():
+            if nm not in sent:
+                continue
+            fam = _facing_family(c["facing_desc"])
+            claim = _claim_family(sent)
+            if fam and claim and fam != claim:
+                add("medium", "人物朝向冲突", sent,
+                    f"调度图事实：{nm}＝{c['facing_desc']}。",
+                    "P1 调度图 > P2 手改 > P3 AI 自动生成：按调度图朝向改写该句，或调整 3D 导演台里的朝向后重检。")
+            # ③ 画面左右冲突
+            cs, fs = _claim_side(sent), _fact_side(c["side"])
+            if cs and fs and cs != fs:
+                add("medium", "画面左右冲突", sent,
+                    f"调度图事实：{nm}在{c['side']}。",
+                    "P1 调度图 > P2 手改：按调度图机位几何改写左右方位（图纸方位≠画面方位，程序已换算）。")
+        # ④ 陈设冲突：视野外的门窗家具被正文写实；画面左右写反
+        for p in props:
+            lb = p["label"]
+            if lb not in sent:
+                continue
+            if lb == "门" and ("门声" in sent or "敲门" in sent or "开门声" in sent or "画外" in sent):
+                continue   # 画外音/声音提及不算画面冲突
+            if not p["in_view"]:
+                add("high", "陈设入画冲突", sent,
+                    f"调度图事实：「{lb}」在本镜机位视野之外，画面不应出现。",
+                    "P1 调度图 > P3 AI 自动生成（可舍弃）：删掉该陈设的画面描述（画外音提及可保留），或到 3D 导演台挪动机位/陈设。")
+            else:
+                cs, fs = _claim_side(sent), _fact_side(p["side"])
+                if cs and fs and cs != fs:
+                    add("medium", "陈设左右冲突", sent,
+                        f"调度图事实：「{lb}」在{p['side']}。",
+                        "P1 调度图 > P2 手改：按机位几何换算的画面左右改写。")
+    return results
+
+
+@app.post("/api/check-prompt-conflicts")
+async def check_prompt_conflicts(req: ConflictCheckRequest):
+    """一键检测提示词与调度图/3D导演台的冲突。纯规则比对，权威源=compute_camera_facts。"""
+    try:
+        plot = _normalize_plot(req.plot_data or {})
+    except Exception:
+        plot = req.plot_data or {}
+    has_geo = isinstance(plot, dict) and (plot.get("camera") or {}).get("x") is not None \
+        and ((plot.get("characters") or []) or (plot.get("props") or []))
+    if not has_geo:
+        return {"conflicts": [], "legend": _CONFLICT_LEGEND,
+                "checked": False,
+                "note": "本镜还没有调度图 / 3D 导演台坐标数据（机位/人物未摆放），没有可比对的 P1 基准；请先在调度图或 3D 导演台摆放人物与机位。"}
+    facts = compute_camera_facts(plot)
+    conflicts = _scan_prompt_conflicts("生图提示词", req.prompt, plot, facts, dynamic=False)
+    conflicts += _scan_prompt_conflicts("视频提示词", req.video_prompt, plot, facts, dynamic=True)
+    order = {"high": 0, "medium": 1, "info": 2}
+    conflicts.sort(key=lambda c: order.get(c["severity"], 3))
+    return {"conflicts": conflicts, "legend": _CONFLICT_LEGEND, "checked": True,
+            "summary": {"high": sum(1 for c in conflicts if c["severity"] == "high"),
+                        "medium": sum(1 for c in conflicts if c["severity"] == "medium"),
+                        "info": sum(1 for c in conflicts if c["severity"] == "info")}}
+
 # ---------- 2.7 AU 表情分析：从提示词捕捉表情/动作关键词，映射到 FACS Action Units ----------
 class ExtractAURequest(BaseModel):
     prompt: str
@@ -2280,55 +3317,80 @@ class ExtractAURequest(BaseModel):
 @app.post("/api/extract-au")
 async def extract_au(req: ExtractAURequest):
     # 第一层：本地词库匹配（零成本、毫秒级）
-    result = au_lexicon.extract_aus(req.prompt)
-    if result["matches"]:
-        result["source"] = "lexicon"
-        result["tips"] = au_lexicon.AU_TIPS
-        return result
+    base = au_lexicon.extract_aus(req.prompt)
+    base_matches = base["matches"]
+    base["tips"] = au_lexicon.AU_TIPS
 
-    # 第二层：词库没命中 → DeepSeek 兜底智能映射（拿 AU 速查表当对照依据）
-    if _dsk_ok():
-        try:
-            response = _dsk().chat.completions.create(
-                model="deepseek-chat",
-                messages=[
-                    {"role": "system", "content": (
-                        "你是 FACS（面部动作编码系统）表情分析器。给定一段提示词和 AU 速查表，"
-                        "找出其中所有表情与动作，映射到 AU 编码组合。规则："
-                        f"只允许使用速查表中存在的 AU 编码（含 AU51-AU58 头部动作）；最多输出 5 组；"
-                        "提示词中的脸型、年龄、外貌、服饰、身份描述（如鹅蛋脸、圆脸、青年、和服等）一律忽略，"
-                        "只提取微表情和面部/头部动作；"
-                        'label 用不超过 12 字的中文概括；没有表情/动作就输出 {"matches": []}。'
-                        '严格只输出 JSON：{"matches": [{"au": "AU12+AU6", "label": "真心笑"}]}，'
-                        "不要 markdown，不要其他文字。"
-                    )},
-                    {"role": "user", "content": (
-                        f"AU速查表：{json.dumps(au_lexicon.AU_TABLE, ensure_ascii=False)}\n\n"
-                        f"提示词：{req.prompt}"
-                    )},
-                ],
-                response_format={"type": "json_object"},
-                max_tokens=400,
-                temperature=0.2,
-            )
-            data = deepseek_json(response)
-            matches = []
-            for m in data.get("matches", [])[:5]:
-                au = str(m.get("au") or "").strip()
-                if re.search(r"AU\d+", au):  # 校验至少含一个合法 AU 编码
-                    matches.append({"au": au, "label": str(m.get("label") or "")[:12], "keywords": []})
-            if matches:
-                codes, seen = [], set()
-                for m in matches:
-                    for code in re.findall(r"AU\d+", m["au"]):
-                        if code not in seen:
-                            seen.add(code); codes.append(code)
-                log_prompt("AU分析(AI兜底)", req.prompt[:120], f"结果={'/'.join(m['au'] for m in matches)}")
-                return {"matches": matches, "au_string": "+".join(codes), "source": "ai"}
-        except Exception as e:
-            print(f"[AU分析] DeepSeek 兜底失败，按无命中处理: {type(e).__name__}: {e}")
+    # ⚠️ 关键：词库命中**不等于分析完了**。用户一句话里常同时写好几个表情
+    # （例："焦急地等消息，又怕又盼"），词库只收录了其中一部分，旧逻辑在这里
+    # 直接 return，剩下的词永远不会被 AI 补上——这就是"分析不到全部词语"的根因。
+    # 现在改成：把已识别的交给 AI 当"已知"，只让它补遗漏的，再合并去重。
+    # 已识别 ≥6 组时收益很低，直接返回省一次等待。
+    if not _dsk_ok() or len(base_matches) >= 6:
+        base["source"] = "lexicon"
+        return base
 
-    return {"matches": [], "au_string": "", "source": "lexicon"}
+    known_desc = "、".join(f"{m['label']}（{m['au']}）" for m in base_matches) or "（无）"
+    try:
+        response = _dsk().chat.completions.create(
+            model="deepseek-chat",
+            messages=[
+                {"role": "system", "content": (
+                    "你是 FACS（面部动作编码系统）表情分析器。给你一段提示词、AU 速查表，"
+                    "以及**词库已识别**的表情条目。你的任务：补全提示词里其余**所有**表情与"
+                    "面部/头部动作，映射到 AU 编码组合。规则："
+                    "① 只输出词库没覆盖的部分，已识别项一律不要重复输出；"
+                    f"② 只允许使用速查表中存在的 AU 编码（含 AU51-AU58 头部动作）；最多输出 6 组；"
+                    "③ 脸型、年龄、外貌、体重、服饰、身份描述（鹅蛋脸/清瘦/少年/铠甲等）一律忽略；"
+                    "④ 一句话里出现多个情绪或情绪交叠（如「又惊又喜」「哭笑不得」「焦急又期待」），"
+                    "必须分别输出、不要合并成一条；"
+                    "⑤ label 用不超过 12 字的中文概括；确实没有遗漏就输出空的 matches。"
+                    '严格只输出 JSON：{"matches": [{"au": "AU12+AU6", "label": "真心笑"}]}，'
+                    "不要 markdown，不要任何解释文字。"
+                )},
+                {"role": "user", "content": (
+                    f"AU速查表：{json.dumps(au_lexicon.AU_TABLE, ensure_ascii=False)}\n\n"
+                    f"词库已识别：{known_desc}\n\n"
+                    f"提示词：{req.prompt}"
+                )},
+            ],
+            response_format={"type": "json_object"},
+            max_tokens=500,
+            temperature=0.2,
+            timeout=9,
+        )
+        data = deepseek_json(response)
+        added = []
+        seen_au = {str(m["au"]).replace(" ", "") for m in base_matches}
+        seen_lbl = {str(m["label"])[:4] for m in base_matches}
+        for m in (data.get("matches") or [])[:6]:
+            au = str(m.get("au") or "").strip()
+            label = str(m.get("label") or "").strip()[:12]
+            if not re.search(r"AU\d+", au):
+                continue
+            if au.replace(" ", "") in seen_au or (label and label[:4] in seen_lbl):
+                continue
+            seen_au.add(au.replace(" ", ""))
+            seen_lbl.add(label[:4])
+            added.append({"au": au, "label": label, "keywords": []})
+
+        if added:
+            merged = (base_matches + added)[:16]
+            codes, seen_code = [], set()
+            for m in merged:
+                for code in re.findall(r"AU\d+", m["au"]):
+                    if code not in seen_code:
+                        seen_code.add(code)
+                        codes.append(code)
+            log_prompt("AU分析(词库+AI补齐)", req.prompt[:120],
+                       f"词库={len(base_matches)}条 补齐={len(added)}条 → {[m['au'] for m in added]}")
+            return {"matches": merged, "au_string": "+".join(codes),
+                    "source": "hybrid" if base_matches else "ai", "tips": au_lexicon.AU_TIPS}
+    except Exception as e:
+        print(f"[AU分析] AI 补齐失败，按词库结果返回: {type(e).__name__}: {e}")
+
+    base["source"] = "lexicon"
+    return base
 
 # ---------- 3. 豆包生图 (存本地返回 URL) ----------
 MAX_REF_IMAGES = 10  # 豆包 seedream 参考图上限
@@ -2338,6 +3400,7 @@ def select_relevant_references(pool: list[str], meta: list[Dict[str, Any]] | Non
 
     策略：
     0. 调度图（kind=diagram，俯视走位/运动轨迹）是导演定稿，永远保留且排在最前，不参与筛选
+    0.5 机位预览（kind=shot_preview，导演台成片构图渲染）是构图基准，同样永不筛掉
     1. 总数不超限 → 全部使用（不加延迟）
     2. 超限 → 先按名字出现在上下文中做关键词匹配（零开销）
     3. 关键词匹配后仍超限或匹配为空 → DeepSeek 按语义挑选相关的（角色优先）
@@ -2345,11 +3408,15 @@ def select_relevant_references(pool: list[str], meta: list[Dict[str, Any]] | Non
     """
     meta = meta or []
     diagram_idx = [i for i, m in enumerate(meta[:len(pool)]) if str(m.get("kind") or "") == "diagram"]
+    # 机位预览帧：导演台成片构图渲染，与调度图同等优先级永不筛掉
+    preview_idx = [i for i, m in enumerate(meta[:len(pool)]) if str(m.get("kind") or "") == "shot_preview"]
+    # 接上一帧：上一镜头末帧是连续镜头的衔接锚点，与调度图同等优先级永不筛掉
+    prev_idx = [i for i, m in enumerate(meta[:len(pool)]) if str(m.get("kind") or "") == "prev_frame"]
 
     def _finalize(picked: list[int]) -> list[int]:
-        """合并调度图与筛选结果：调度图排最前，去重、限流、保序"""
+        """合并调度图/预览帧/末帧与筛选结果：调度图、预览帧、末帧排最前，去重、限流、保序"""
         seen, ordered = set(), []
-        for i in diagram_idx + list(picked):
+        for i in diagram_idx + preview_idx + prev_idx + list(picked):
             if 0 <= i < len(pool) and i not in seen:
                 seen.add(i)
                 ordered.append(i)
@@ -2361,7 +3428,7 @@ def select_relevant_references(pool: list[str], meta: list[Dict[str, Any]] | Non
     # 第一步：关键词匹配
     kw_hits = []
     for i, m in enumerate(meta[:len(pool)]):
-        if str(m.get("kind") or "") == "diagram":
+        if str(m.get("kind") or "") in ("diagram", "shot_preview", "prev_frame"):
             continue
         name = str(m.get("name") or "").strip()
         if name and len(name) >= 2 and name in context:
@@ -2375,7 +3442,7 @@ def select_relevant_references(pool: list[str], meta: list[Dict[str, Any]] | Non
         budget = max(MAX_REF_IMAGES - len(diagram_idx), 0)
         candidates = []
         for i in range(min(len(pool), len(meta)) if meta else 0):
-            if i in set(diagram_idx):
+            if i in set(diagram_idx) or i in set(preview_idx) or i in set(prev_idx):
                 continue
             m = meta[i]
             candidates.append({
@@ -2497,6 +3564,10 @@ def _detect_frame_position_overrides(prompt: str, characters: list) -> str:
 
 @app.post("/api/generate-image")
 async def generate_image(req: ImageRequest):
+    # 入口统一净化：剥掉 AU 编码（生图模型不认识），正文里的中文情绪词照常保留
+    req.prompt = _clean_au_codes(req.prompt or "")
+    if req.context:
+        req.context = _clean_au_codes(req.context)
     log_prompt("生图", req.prompt, f"size={req.size} 参考图={len(req.reference_urls or [])}张")
     payload = {
         "model": DOUBAO_MODEL,
@@ -2506,6 +3577,7 @@ async def generate_image(req: ImageRequest):
         "watermark": False,
     }
     missing_refs: list[str] = []  # 无参考图的调用路径也要初始化（首次生成设定图时 reference_urls 为空）
+    n_diag = 0                    # 本镜送了几张调度图纸（>0 = 走导演定稿的构图注入 + 不算篇幅压缩）
     if req.reference_urls and len(req.reference_urls) > 0:
         # 先按相关性筛选（关键词 -> DeepSeek），再转换；豆包云端无法下载本机 127.0.0.1 URL，
         # 本地图一律转 base64 data URI 直传，公网 URL 原样保留
@@ -2549,6 +3621,17 @@ async def generate_image(req: ImageRequest):
                            f"剔除：{'、'.join(removed)}"
                            + (f"；保留入画角色：{'、'.join(vis_names) or '无'}" if allowed is not None else ""))
             pool, metas = f_pool, f_meta
+        # 场景设定图的"环境陈设必须与此图一致"会压过提示词里的"门不入画"（图片强于文字，
+        # 实测门从场景图漏进画面右缘）：有调度数据时给场景参考说明追加取舍规则——
+        # 视野外的门窗严禁入画，陈设位置以调度图纸为准
+        if req.plot_data:
+            _scene_note = _hidden_props_note(req.plot_data)
+            if _scene_note:
+                for _i in range(len(metas)):
+                    if isinstance(metas[_i], dict) and str(metas[_i].get("kind") or "") == "scene":
+                        _d = str(metas[_i].get("description") or "")
+                        metas[_i]["description"] = (_d + "。" if _d else "") + _scene_note
+                log_prompt("场景参考取舍", _scene_note[:140])
         picked = select_relevant_references(pool, metas, context)
         # 容错：项目搬运/换电脑后 static/uploads 里可能没有旧参考图文件（此前会报
         # "参考图文件不存在"直接炸掉整个生图）。缺失的参考图跳过、不阻断生成，
@@ -2596,6 +3679,9 @@ async def generate_image(req: ImageRequest):
                     n = str(metas[i].get("name") or "").strip() or "调度图"
                     if d:
                         notes.append(f"▸{n}：{d}")
+            # 完整版调度指令（对齐 3D 桌面版这套已跑通的口径：四规则 + 口述 + 纵深解读 +
+            # 坐标翻译 + 落位覆盖 + 结尾重申，全部追加在 prompt 末尾——末尾服从度最高）。
+            # 此前移动端为了"省字数"把它砍成 300 字并挪到开头，实测反而完全不生效。
             directive = (
                 f"【机位与调度（最高优先级）】本图的前 {n_diag} 张参考图是导演定稿的调度图纸："
                 "正上方垂直俯视的平面图（白底图纸，人偶棋子图标＝人物、旁边标签是人名，「机位」符号＋扇形视锥＝摄影机位置与拍摄朝向，虚线箭头＝运动路线）。"
@@ -2616,18 +3702,45 @@ async def generate_image(req: ImageRequest):
                 "红框与机位真实视野冲突时，以机位与真实透视为准，红框只作构图参考。\n"
                 "注意：最终输出的是正常视角的真实镜头画面，不要画成俯视图、示意图或图纸形式；画面里的人物是成片形象，不是图标。\n"
             )
+            # 场景空间锚定：图纸是白底俯视站位图，没有任何室内外线索，模型容易顺势把
+            # 室内场景画成露天（实测：正文写屋内织布，成图整个搬到室外）。按正文空间词锚定。
+            _scene_txt = str(req.prompt or "") + " " + str(req.context or "")
+            if _INDOOR_MARK.search(_scene_txt):
+                directive += (
+                    "▸ 场景空间＝室内（最高优先级）：墙体、门窗、屋顶、梁柱等室内结构必须画出，"
+                    "俯视图纸只是站位平面图、不代表露天场地，严禁画成室外或空旷场地；\n"
+                )
+            elif _OUTDOOR_MARK.search(_scene_txt):
+                directive += "▸ 场景空间＝室外：按正文地点与环境要素执行，图纸只定站位与机位、不定室内外；\n"
             if notes:
-                directive += "导演口述的调度要求（注意：机位位置与朝向、谁入画、每人身体朝向一律以上面图纸坐标数据为准——导演手动移过机位后口述里的旧机位描述作废；口述只用来补充动作、剧情与细节）：\n" + "\n".join(notes) + "\n"
+                directive += ("导演口述的调度要求（注意：机位位置与朝向、谁入画、每人身体朝向一律以上面图纸坐标数据为准——"
+                              "导演手动移过机位后口述里的旧机位描述作废；口述只用来补充动作、剧情与细节）：\n"
+                              + "\n".join(notes) + "\n")
             else:
                 directive += "请观察调度图纸中人偶图标的站位与朝向、虚线运动路线、机位符号与视锥方向，把上述空间关系落到画面里。\n"
             if req.diagram_brief:
                 directive += f"【画面纵深调度解读】（机位视角换算的辅助参考）：{req.diagram_brief.strip()}\n"
-            # 坐标翻译：生图模型看不懂俯视图纸上的图标，但听得懂"谁离镜头最近/在哪侧/谁不入画"
-            # 顶层镜头翻译：DeepSeek 按坐标+程序几何事实产出"镜头画面 JSON"，失败自动回退程序直译
+            # 坐标翻译：生图模型看不懂俯视图纸上的图标，但听得懂"谁离镜头最近/在哪侧/谁不入画/朝哪边"。
+            # 优先 AI 镜头翻译（按坐标+程序几何事实产出，内容哈希缓存），失败自动回退程序直译。
             plot_txt = await build_plot_prompt_text(
                 req.plot_data or {}, (req.prompt or "") + " " + (req.context or ""), dynamic=False)
             if plot_txt:
                 directive += "【调度图纸坐标数据（程序按坐标翻译，权威）】\n" + plot_txt + "\n"
+            # 机位预览帧：导演台成片构图的实时渲染——用户要求"最后出图以预览窗所见为准"。
+            # 指明它是第几张参考图并声明构图权威性；同时压住"把示意模型画进画面/照抄示意渲染风格"的风险
+            _pv_notes = []
+            for k, i in enumerate(picked):
+                if i < len(metas) and str(metas[i].get("kind") or "") == "shot_preview":
+                    _pv_notes.append(f"第{k + 1}张参考图")
+            if _pv_notes:
+                directive += (
+                    f"【机位预览·构图基准（最高优先级）】{'、'.join(_pv_notes)}是导演 3D 导演台的机位预览"
+                    "（从镜头位置按机位坐标实时渲染的本镜构图）：最终画面的人物站位、画面左右、远近大小层次、"
+                    "身体朝向、谁被谁遮挡、机位高度与视角必须与该图一致——该图就是成片应该达到的构图。"
+                    "但图中的彩色胶囊、方块、锥体只是站位示意模型：人物真实长相/发型/服装按角色设定图与提示词执行，"
+                    "家具门窗真实样式按场景设定图与提示词执行；严禁把胶囊人偶、几何方块、琥珀色锥体等示意元素画进画面；"
+                    "画风、光线、色调按画风设定与提示词执行，不参照该图的示意渲染风格。\n"
+                )
             # 导演在重写框里直接指定的画面落位（画面右上角/偏右/居中…）必须压过程序算的默认落位——
             # 否则权威名单里的"画面左/右"会把导演指令判为冲突作废，重写永远不生效
             override_txt = _detect_frame_position_overrides(
@@ -2644,14 +3757,15 @@ async def generate_image(req: ImageRequest):
                 "【结尾重申·最高优先级】请逐条核对后再出图：①镜头位置与朝向只由「机位」符号决定；"
                 "②画面中出现的人物必须且只能是入画名单里的人，绝不入画名单里的人一个都不能出现；"
                 "③人物远近与大小按入画名单从近到远按透视排列；"
-                "④人物身体朝向逐人核对：写「正面对镜头」的必须正脸朝观众，写「完全背对镜头」的只能画背影、画面里严禁出现他的脸，写「侧对镜头」的只露写明那一侧的侧脸；"
+                "④人物身体朝向逐人核对：写「正面对镜头」的必须正脸朝向其被指定的面朝目标（面朝「门」就看着门，未指定时朝观众），写「完全背对镜头」的只能画背影、画面里严禁出现他的脸，写「侧对镜头」的只露写明那一侧的侧脸；被指定了面朝目标的人严禁为露脸而转向镜头；"
                 "⑤若存在【导演落位指令】，被指定人物在画面中的落位按导演指定执行；"
                 "⑥最终输出正常视角的真实镜头画面，不是俯视图或示意图。\n"
             )
-            # 🌟 强指令放到 prompt 末尾：大模型对末尾指令的服从度最高，放开头容易被当背景介绍忽略
+            # 🌟 强指令放在 prompt 末尾：大模型对末尾指令的服从度最高，放开头容易被当背景介绍忽略
             payload["prompt"] = payload["prompt"] + "\n\n" + directive
-            log_prompt("调度约束注入(尾部)", f"调度图 {n_diag} 张\n" + "\n".join(notes)
-                       + f"\nbrief={req.diagram_brief or ''}\nplot_data={'有' if req.plot_data else '无'}\n---\n" + directive, "")
+            log_prompt("调度约束注入(尾部·全量)", f"调度图 {n_diag} 张\n" + "\n".join(notes)
+                       + f"\nbrief={req.diagram_brief or ''}\nplot_data={'有' if req.plot_data else '无'}\n"
+                       + f"坐标翻译={'有' if plot_txt else '无'}\n---\n" + directive, "")
 
         # 影子镜头规则：挪到所有注入之后（prompt 最终末尾）再注入——末尾服从度最高，
         # 原位置在调度约束之后、外貌锚点/融脸之前，会被后续"画人"指令稀释（实测仍会出人形）
@@ -2663,20 +3777,31 @@ async def generate_image(req: ImageRequest):
         # 前端把每位角色的最新外貌放在 character 参考图元数据的 description 里带来。
         # 影子镜头（shadow_only）时跳过：外貌锚点是"画人"指令，会把模型往人物本体上拉
         anchor_lines = []
+        _anchor_map: dict[str, str] = {}
+        # 本镜正文是否已经写清楚穿什么：写了就不再让锚点重复另一套服装（角色卡常是铠甲造型，
+        # 与本镜的民女打扮并存时模型会随机挑一套，实测出现"布裙镜头画出铠甲"）
+        _prompt_says_outfit = bool(_OUTFIT_WORD.search(str(req.prompt or "")))
         for i in range(len(metas)):
             m = metas[i] if i < len(metas) else {}
             if str(m.get("kind") or "") != "character":
                 continue
+            if m.get("outfit"):
+                continue  # 服装变体图只作参考，不单独写入外貌锚点（否则会覆盖本体长相摘要）
             n = str(m.get("name") or "").strip()
-            d = str(m.get("description") or "").strip()
-            if n and d:
-                anchor_lines.append(f"▸{n}：{d}")
+            if not n:
+                continue
+            # 前端传 appearance = 角色卡的 image_prompt 原文（"画设定图"用的），
+            # 这里只取外貌与服装分句，丢掉立绘/站姿/纯色背景/画质这类设定图专用要求。
+            raw = str(m.get("appearance") or "").strip() or str(m.get("description") or "").strip()
+            app = _portrait_only(raw, keep_outfit=not _prompt_says_outfit)
+            if app and len(app) > len(_anchor_map.get(n, "")):
+                _anchor_map[n] = app
+        anchor_lines = [f"▸{n}：{a}" for n, a in _anchor_map.items()]
         if anchor_lines and not shadow_only:
             anchor_txt = (
-                "【角色外貌锚点（权威基准）】以下是导演在角色卡上最终确定的各角色外貌（可能已修改过，"
-                "其他来源与此矛盾的旧外貌描述一律作废）：\n" + "\n".join(anchor_lines)
-                + "\n画面中人物的长相、性别、发型发色、体格必须严格照锚点绘制；"
-                "仅当本条分镜提示词中明确写了与锚点不同的服装或造型（剧情需要换装）时，该处按分镜提示词执行，其余外貌特征仍按锚点。\n"
+                "【角色外貌锚点·权威】\n" + "\n".join(anchor_lines)
+                + "\n锚点只补本镜提示词没写到的部分：提示词已明确写出的长相/发型/服装一律以提示词为准，"
+                "不得用锚点覆盖；锚点也只锁长相与服装，画面构图、站姿、背景、镜头按提示词与调度，不得画成设定图/立绘。\n"
             )
             payload["prompt"] = payload["prompt"] + "\n\n" + anchor_txt
             log_prompt("角色外貌锚点注入", "\n".join(anchor_lines), "")
@@ -2690,14 +3815,34 @@ async def generate_image(req: ImageRequest):
                 face_notes.append(f"第{k + 1}张参考图是角色「{nm}」的真实人物面部照片")
         if face_notes:
             face_txt = (
-                "【融脸指令·面部相似度最高优先级】" + "；".join(face_notes) + "。"
-                "生成画面中该角色的脸型、五官、面部特征必须与照片中人物高度相似（把照片中的脸融进画面角色）；"
-                "脸型与五官以融脸照片为准（优先于外貌锚点与文字提示词中的面部描述），"
-                "发型、发色、服装、体型、画风仍按角色设定图与提示词执行。照片仅取面部特征——"
-                "严禁把照片中的真实背景、衣着、光线构图画进画面，严禁把画面画成真人照片写实风格（画风仍按本条提示词）。"
+                "【融脸·最高优先】" + "；".join(face_notes) + "：生成画面中该角色的脸型五官必须与照片高度相似；"
+                "发型/发色/服装/体型/画风仍按设定图与提示词；严禁带入照片的背景衣着与真人写实风格。\n"
             )
             payload["prompt"] = payload["prompt"] + "\n\n" + face_txt
             log_prompt("融脸指令注入", "；".join(face_notes), "")
+
+        # 设定图参考压制：角色设定图（kind=character）本身是"单人全身立绘、正面站姿、纯色背景"，
+        # 生图模型看到图就会把"站着的人"照搬进画面——与本镜正文描述的人物并存时直接出
+        # "两个父亲"（同角色画两次）。这里按最终发送序号指明哪些张是角色设定图，并注入
+        # 强规则：参考图只锁长相服装，姿态/背景/人数以正文为准，严禁复制成第二个人。
+        # 放在融脸之后、影子规则之前（影子规则必须保持 prompt 最后一段）。
+        char_notes = []
+        for k, i in enumerate(picked):
+            if i < len(metas) and str(metas[i].get("kind") or "") == "character":
+                nm = str(metas[i].get("name") or "").strip()
+                char_notes.append(f"第{k + 1}张" + (f"（角色「{nm}」的设定图）" if nm else "（角色设定图）"))
+        if char_notes:
+            ref_rule = (
+                "【角色设定图参考·用途限定（最高优先级）】" + "、".join(char_notes)
+                + "。这些参考图的唯一用途是锁定对应角色的长相、发型与服装（照着这个人画）。除此之外：\n"
+                "①参考图中的站姿、面向、纯色背景、设定图版式一律不得照搬——人物在本画面中的动作、姿态、朝向、"
+                "所处环境完全按提示词正文执行；\n"
+                "②画面人数严格等于提示词正文写出的人物数量：参考图里的每个角色只画一次，"
+                "严禁把参考图人物复制成第二个人、双胞胎、影子分身或背景路人；\n"
+                "③提示词正文没有提到的角色，即使参考图里出现了也绝不入画。"
+            )
+            payload["prompt"] = payload["prompt"] + "\n\n" + ref_rule
+            log_prompt("设定图参考压制注入", "；".join(char_notes), "")
 
         # 影子镜头规则最终落位：这里是 prompt 组装的最后一步（调度约束/外貌锚点/融脸之后），
         # 追加到最末尾——末尾服从度最高，压过一切"画人"指令。
@@ -2724,6 +3869,10 @@ async def generate_image(req: ImageRequest):
                 )
             payload["prompt"] = payload["prompt"].replace("__SHADOW_RULE__", rule)
             log_prompt("影子镜头规则注入(末尾)", f"shadow_only={shadow_only}（{'已剔除角色参考图与外貌锚点' if shadow_only else '人物+影子同框，规则放宽'}）", "")
+
+    # 不做篇幅压缩：调度指令是构图能否执行的唯一依据，任何"省字数"压缩都会把它吃掉
+    # （实测教训：780 字硬压缩把 2500 字构图指令压成 55 字，成图完全不听图纸）。
+    # 3D 桌面版从不压缩、用同一套指令跑得通，说明模型吃得住这个长度。
 
     headers = {
         "Authorization": f"Bearer {_require_own_key('ark') or _eff_key('ark')}",
@@ -3015,6 +4164,53 @@ async def upload_image(req: UploadImageRequest):
     with open(filepath, "wb") as f:
         f.write(img_bytes)
     return {"image_url": f"/static/uploads/{filename}"}
+
+# ---------- 3.6 参考视频上传（垫片用：存到 uploads，返回 URL 供 Seedance 垫参考视频） ----------
+class UploadRefVideoRequest(BaseModel):
+    video_base64: str  # data URI 或纯 base64
+    filename: str | None = None
+
+@app.get("/api/download-video")
+async def download_video_proxy(request: Request, url: str):
+    """同源视频下载代理：豆包成片在火山 CDN（跨域），手机浏览器直连 fetch 会被 CORS 拦，
+    回落到"长按保存"等兜底路径时部分浏览器只存视频流、丢掉音频轨（用户实测：网页播放有声、
+    下载无声）。经本服务器原样转发完整字节（含音轨），前端拿同源 blob 触发保存。"""
+    from fastapi.responses import Response
+    u = (url or "").strip()
+    if not u.startswith(("http://", "https://")):
+        raise HTTPException(400, "无效的视频地址（仅支持 http/https 直链）")
+    async with httpx.AsyncClient(timeout=120, follow_redirects=True) as client:
+        r = await client.get(u)
+    if r.status_code >= 400:
+        raise HTTPException(502, f"从视频源拉取失败（上游 HTTP {r.status_code}），可稍后再试")
+    if len(r.content) < 1000:
+        raise HTTPException(502, "从视频源拉取到的内容为空，源链接可能已过期")
+    return Response(content=r.content, media_type="video/mp4",
+                    headers={"Cache-Control": "no-store"})
+
+@app.post("/api/upload-ref-video")
+async def upload_ref_video(req: UploadRefVideoRequest):
+    b64 = req.video_base64.strip()
+    if b64.startswith("data:"):
+        b64 = b64.split(",", 1)[1] if "," in b64 else ""
+    try:
+        video_bytes = base64.b64decode(b64)
+    except Exception:
+        raise HTTPException(400, "视频数据无效")
+    if len(video_bytes) < 1000:
+        raise HTTPException(400, "视频内容为空或损坏")
+    raw = (req.filename or "").lower()
+    ext = ".mp4"
+    for e in (".mp4", ".webm", ".mov", ".m4v"):
+        if raw.endswith(e):
+            ext = e
+            break
+    filename = f"refvideo_{uuid.uuid4().hex}{ext}"
+    filepath = os.path.join("static/uploads", filename)
+    with open(filepath, "wb") as f:
+        f.write(video_bytes)
+    print(f"📥 参考视频已上传: {filename} ({len(video_bytes) / 1024 / 1024:.1f}MB)")
+    return {"video_url": f"/static/uploads/{filename}"}
 
 # ---------- 3.5 配音：VoxCPM 声音克隆 / 文本转语音（语音服务独立进程，未启动时端点明确报错不拖垮主流程） ----------
 class UploadVoiceRequest(BaseModel):
@@ -3364,10 +4560,239 @@ def _frame_divergence(url1: str, url2: str) -> float | None:
         return None
 
 
+# 局域网/本机 host：这些地址 Ark/AutoDL 云端都无法回源拉取
+_LOCAL_HOST_RE = re.compile(r"^(localhost(:\d+)?|127\.\d+\.\d+\.\d+(:\d+)?|0\.0\.0\.0(:\d+)?|\[::1\](:\d+)?|::1(:\d+)?|192\.168\.\S+|10\.\S+|172\.(1[6-9]|2\d|3[01])\.\S+)$", re.I)
+
+def public_media_url(request, url: str, share_code: str | None = None, origin: str | None = None) -> str | None:
+    """把本机 /static/ 路径转成公网可拉取的绝对 URL（附 sharecode 过代理门禁）。
+    Ark/AutoDL 云端无法访问本机与局域网地址；线上版经公网域名访问时才能转出。
+    优先用前端传来的页面地址（origin，可靠），请求头 host 经代理转发后常是内网地址只作兜底。
+    无法确定公网地址（本地部署/缺 sharecode）时返回 None。"""
+    if not url or "/static/" not in url:
+        return None
+    scheme = host = ""
+    if origin:
+        try:
+            p = urlparse(origin if "://" in origin else f"https://{origin}")
+            scheme, host = (p.scheme or "https"), p.netloc
+        except Exception:
+            pass
+    if not host:
+        host = ((request.headers.get("x-forwarded-host") or request.headers.get("host") or "")
+                .split(",")[0].strip())
+        scheme = (request.headers.get("x-forwarded-proto") or "https").split(",")[0].strip()
+    if not host or _LOCAL_HOST_RE.match(host):
+        return None
+    path = "/static/" + url.split("/static/")[-1].split("?")[0]
+    out = f"{scheme}://{host}{path}"
+    if share_code:
+        out += f"?sharecode={share_code}"
+    return out
+
+def local_url_to_data_uri_video(url: str) -> str:
+    """本地视频 URL → base64 data URI（AutoDL 垫参考视频兜底用）。
+    非 /static/ 的远程 URL 原样返回。"""
+    if "/static/" not in url:
+        return url
+    path_part = url.split("/static/")[-1].split("?")[0]
+    local_path = os.path.join("static", path_part)
+    if not os.path.exists(local_path):
+        raise HTTPException(404, f"参考视频文件不存在：{local_path}")
+    ext = os.path.splitext(local_path)[1].lower().lstrip(".")
+    mime = {"mp4": "mp4", "webm": "webm", "mov": "quicktime", "m4v": "mp4"}.get(ext, "mp4")
+    with open(local_path, "rb") as f:
+        b64 = base64.b64encode(f.read()).decode()
+    return f"data:video/{mime};base64,{b64}"
+
+# ---------- 4b. 豆包 Seedance（火山方舟 Ark）视频生成 ----------
+# 提交：POST {DOUBAO_BASE}/contents/generations/tasks  →  {"id": "cgt-..."}
+# 查询：GET  {DOUBAO_BASE}/contents/generations/tasks/{id} → status: queued/running/succeeded/failed
+# 返回的 task_id 统一加 "doubao:" 前缀，与 AutoDL 任务在状态查询/保存接口里区分开。
+DOUBAO_TASK_PREFIX = "doubao:"
+
+def _doubao_ratio_from_aspect(aspect: float | None) -> str:
+    """参考图宽高比 → Seedance ratio 档位（官方支持 21:9/16:9/4:3/1:1/3:4/9:16）；拿不到宽高比默认 16:9。"""
+    if not aspect:
+        return "16:9"
+    if aspect >= 21 / 9 * 0.92:
+        return "21:9"
+    if aspect > 1.20:
+        return "16:9"
+    if aspect > 1.05:
+        return "4:3"
+    if aspect < 0.42:
+        return "9:16"
+    if aspect < 0.75:
+        return "3:4"
+    return "1:1"
+
+async def submit_doubao_video(req: VideoRequest, prompt: str, frame_mode: str) -> dict:
+    """提交豆包 Seedance 视频生成任务（火山方舟 contents/generations/tasks）。
+    参考图按帧模式映射 role：reference → reference_image；first/last/first_last → first_frame/last_frame。
+    垫参考视频（req.ref_video_urls）以 reference_video 传入，只作运镜/构图/节奏引导。"""
+    _require_own_key("ark")
+    api_key = _eff_key("ark").strip()
+    if not api_key:
+        raise HTTPException(400, "未配置即梦(豆包) ARK API Key：请到 ⚙️ API 设置填入，或在程序目录 .env 写入 ARK_API_KEY=你的key")
+
+    model = (req.video_model or DOUBAO_VIDEO_MODEL or "").strip() or DOUBAO_VIDEO_MODEL
+
+    content: list[dict] = [{"type": "text", "text": prompt}]
+
+    def img_entry(url: str, role: str) -> dict:
+        u = str(url).strip()
+        # 公网直链优先（保住"信任模型产物"的原始字节）；本地部署转不出 URL 才回落 base64
+        val = u if u.startswith(("http://", "https://")) else local_url_to_data_uri(url)
+        return {"type": "image_url", "image_url": {"url": val}, "role": role}
+
+    if frame_mode == "reference":
+        for u in (req.image_urls or [])[:30]:
+            content.append(img_entry(u, "reference_image"))
+    elif frame_mode == "first":
+        if not req.first_frame_url:
+            raise HTTPException(400, "首帧模式需要先标记首帧分镜图")
+        content.append(img_entry(req.first_frame_url, "first_frame"))
+    elif frame_mode == "last":
+        if not req.last_frame_url:
+            raise HTTPException(400, "尾帧模式需要先标记尾帧分镜图")
+        content.append(img_entry(req.last_frame_url, "last_frame"))
+    else:  # first_last
+        if not (req.first_frame_url and req.last_frame_url):
+            raise HTTPException(400, "首尾帧模式需要同时标记首帧与尾帧分镜图")
+        content.append(img_entry(req.first_frame_url, "first_frame"))
+        content.append(img_entry(req.last_frame_url, "last_frame"))
+
+    # 垫参考视频：引导运镜/节奏/构图（Seedance 要求公网 web URL，不接受 base64，
+    # 也不接受本机/局域网地址）。正常流程上方已全部公网化。
+    # 注意：不能拿 "/static/" in u 判断本机路径——转换后的公网直链路径里同样含 /static/，
+    # 之前正是这个条件把自家转换结果拦下（v88~v89 报错的真实原因）。
+    # 正确判断：只放行 http(s) 绝对链接，其余（相对路径/data: URI）一律报错并带原始值。
+    for u in (req.ref_video_urls or [])[:10]:
+        u = str(u).strip()
+        if not u:
+            continue
+        if not (u.startswith("http://") or u.startswith("https://")):
+            raise HTTPException(400,
+                f"[垫视频诊断v90] 收到异常值（前80字符）：{u[:80]}。"
+                "垫参考视频必须是公网可访问的 URL（Ark 只接受 web 直链，不接受 base64 或本机地址）。"
+                "请把这条报错完整发给开发者。")
+        content.append({
+            "type": "video_url",
+            "video_url": {"url": u},
+            "role": "reference_video",
+        })
+
+    payload = {
+        "model": model,
+        "content": content,
+        "generate_audio": True,
+        "ratio": _doubao_ratio_from_aspect(req.image_aspect),
+        # 官方限制 4-30s（Seedance 2.5 单段直出最长 30s；3-15s 是 2.0 的旧限制）
+        "duration": max(4, min(int(req.duration or 5), 30)),
+        # 分辨率：官方可选 480p/720p/1080p（默认 480p 最省钱，720p 为官方默认档）
+        "resolution": (req.doubao_resolution or "").lower() if (req.doubao_resolution or "").lower() in ("480p", "720p", "1080p") else "480p",
+        "watermark": False,
+    }
+
+    print(f"📤 提交给豆包 Seedance: model={model}, ratio={payload['ratio']}, duration={payload['duration']}s, "
+          f"图={sum(1 for c in content if c['type'] == 'image_url')}张, 垫视频={sum(1 for c in content if c['type'] == 'video_url')}条")
+    log_prompt("生视频(Seedance)", prompt, f"model={model} 模式={frame_mode} duration={payload['duration']} ratio={payload['ratio']}")
+
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+
+    async def _post(pl: dict):
+        last_exc = None
+        async with httpx.AsyncClient(timeout=60) as client:
+            for attempt in (1, 2, 3):
+                try:
+                    return await client.post(f"{DOUBAO_BASE}/contents/generations/tasks", headers=headers, json=pl)
+                except httpx.HTTPError as e:
+                    last_exc = e
+                    print(f"⚠️ 连接火山方舟异常(第{attempt}次): {type(e).__name__}，重试…")
+                    await asyncio.sleep(1.5)
+        raise HTTPException(503, f"连接火山方舟失败（网络瞬断，已重试 3 次）：{type(last_exc).__name__}，请稍后再试")
+
+    resp = await _post(payload)
+
+    # 自动降级重试（实测诊断 2026-11-14）：真人审核拦的几乎总是"角色/场景设定图"——
+    # 它们虽然是豆包产物，但是用用户上传的真人脸参考照片做图生图产出的衍生物，
+    # 不在官方"Seedream 5.0 文生图产物"信任白名单内（官方文档 82379/2608626）；
+    # 而分镜图单独提交实测可过审。被拦时自动只保留第一张参考图（分镜图）重提一次。
+    def _is_sensitive(r) -> bool:
+        return r.status_code == 400 and ("SensitiveContentDetected" in r.text or "real person" in r.text)
+
+    if _is_sensitive(resp):
+        _img_entries = [c for c in content if c.get("type") == "image_url"]
+        _has_extra = len(_img_entries) > 1 or any(c.get("type") == "video_url" for c in content)
+        _first = _img_entries[0] if _img_entries else None
+        if _has_extra and _first and _first.get("role") == "reference_image":
+            print("🚧 Seedance 真人审核拦截 → 自动降级：只保留分镜图重试（设定图/垫视频属图生图衍生或外部素材，不在官方信任白名单）")
+            log_prompt("Seedance审核降级重试", prompt,
+                       f"原图{len(_img_entries)}张+垫视频{sum(1 for c in content if c.get('type')=='video_url')}条 → 降级为仅分镜图")
+            resp = await _post({**payload, "content": [{"type": "text", "text": prompt}, _first]})
+
+    if resp.status_code == 401:
+        raise HTTPException(401, "ARK API Key 无效或已过期，请到 ⚙️ API 设置检查即梦(豆包) Key")
+    if resp.status_code != 200:
+        # 垫视频相关报错时把实际提交的 URL 带上，方便确诊 Ark 为什么拒收
+        _rv = [c["video_url"]["url"] for c in content if c.get("type") == "video_url"]
+        if _rv and "reference_video" in resp.text:
+            raise HTTPException(resp.status_code,
+                f"Seedance 提交失败：{resp.text[:400]}\n--- 实际提交的垫视频 URL ---\n" + "\n".join(_rv[:4]))
+        # 方舟输入审核：参考图疑似真人。官方政策：Seedance 2.5/2.0 不支持直接上传含真人脸的参考图，
+        # 但同一方舟账号 30 天内的 Seedream 5.0 文生图产物被信任（官方文档 82379/2608626）。
+        # 降级后仍被拦说明分镜图本身不可信：上传的图/编辑过的图/超30天/别的账号生成。
+        if "SensitiveContentDetected" in resp.text or "real person" in resp.text:
+            raise HTTPException(400,
+                "🚫 Seedance 审核判定参考图可能包含真人（已自动尝试只保留分镜图重试，仍被拦）。"
+                "说明本镜分镜图不在官方信任白名单内——只有「同一个方舟账号、30 天内、豆包生图(Seedream 5.0)的原始产物」"
+                "才免审核；上传的图、裁剪/压缩/编辑过的图、超过 30 天的图都会失效。"
+                "解决：用豆包生图重新生成本镜分镜图后立刻生成视频，或写实项目改用 AutoDL 工作流引擎（无此限制）。")
+        raise HTTPException(resp.status_code, f"Seedance 提交失败：{resp.text[:500]}")
+    data = resp.json() or {}
+    task_id = data.get("id")
+    if not task_id:
+        raise HTTPException(500, f"Seedance 未返回任务 ID：{str(data)[:300]}")
+    return {"task_id": f"{DOUBAO_TASK_PREFIX}{task_id}", "raw": data, "engine": "doubao"}
+
+
+async def get_doubao_task(task_id: str, api_key: str | None = None) -> dict:
+    """查询豆包 Seedance 任务状态。返回 {"status": QUEUED/RUNNING/SUCCESS/FAILURE, "video_url": str|None, "raw": dict}"""
+    key = (api_key or _eff_key("ark")).strip()
+    if not key:
+        raise HTTPException(400, "未配置即梦(豆包) ARK API Key，无法查询 Seedance 任务")
+    headers = {"Authorization": f"Bearer {key}"}
+    async with httpx.AsyncClient(timeout=60) as client:
+        resp = await client.get(f"{DOUBAO_BASE}/contents/generations/tasks/{task_id}", headers=headers)
+    if resp.status_code != 200:
+        raise HTTPException(resp.status_code, f"Seedance 任务查询失败：{resp.text[:300]}")
+    data = resp.json() or {}
+    status = str(data.get("status") or "").lower()
+    video_url = None
+    if status == "succeeded":
+        content = data.get("content") or {}
+        video_url = content.get("video_url")
+        if isinstance(video_url, dict):
+            video_url = video_url.get("url")
+    mapped = {"queued": "QUEUED", "running": "RUNNING", "succeeded": "SUCCESS", "failed": "FAILURE"}.get(status, "UNKNOWN")
+    # 异步失败原因翻译：方舟的任务失败信息是英文原文，前端只显示"生成失败"看不到原因
+    friendly_error = None
+    if status == "failed":
+        raw_err = str((data.get("error") or {}).get("message") or data.get("error") or "")
+        if "copyright" in raw_err.lower():
+            friendly_error = ("输出内容被平台版权审核误伤（与参考图无关，概率性误判）：点重新生成重试一次通常即可通过。"
+                              "若同一镜反复出现，可微调视频提示词避开与特定影视剧相似的表述。")
+        elif "SensitiveContentDetected" in raw_err or "real person" in raw_err.lower():
+            friendly_error = ("成片内容审核未通过（平台对输出画面的概率性审核）：点重新生成重试一次通常即可通过。")
+        elif raw_err:
+            friendly_error = f"Seedance 任务失败：{raw_err[:200]}"
+    return {"status": mapped, "video_url": video_url, "raw": data, "error": friendly_error}
+
+
 @app.post("/api/generate-video")
 @app.post("/api/submit-video")  # 别名路由：绕开个别环境对该路径的拦截（浏览器实测 /api/generate-video 请求消失时备用）
-async def generate_video(req: VideoRequest):
-    print(f"📥 收到视频提交请求: mode={req.frame_mode}, 参考图={len(req.image_urls or [])}张, duration={req.duration}s")
+async def generate_video(req: VideoRequest, request: Request):
+    print(f"📥 收到视频提交请求: mode={req.frame_mode}, 参考图={len(req.image_urls or [])}张, duration={req.duration}s, 垫视频={len(req.ref_video_urls or [])}条")
     # 帧模式归一化（先算好，才能决定用哪支令牌）
     frame_mode = (req.frame_mode or "reference").lower()
     if frame_mode in ("first_frame", "first"):
@@ -3395,15 +4820,19 @@ async def generate_video(req: VideoRequest):
             req.image_urls = _kept_urls + _rest[9:]
 
     # 运动轨迹指令：调度图纸（俯视/轨迹）坐标翻译成自然语言，与参考图一起约束视频的人物走位与镜头运动
-    prompt = req.prompt
+    # 入口净化：视频模型更不认识 AU 编码，混在正文里会直接让脸崩坏
+    prompt = _clean_au_codes(req.prompt or "")
+    if req.env_context:
+        req.env_context = _clean_au_codes(req.env_context)
     # 时长校正：动作时序文案是建分镜时按当时的时长生成的，导演后来改了时长也不会重写——
-    # 发视频时按实际时长重申时间轴，避免"总时长3秒"配7秒成片导致动作节奏错乱
+    # 发视频时按实际时长重申时间轴，避免"总时长3秒"配7秒成片导致动作节奏错乱。
+    # 写法教训：陈述句会被 i2v 模型当字幕烧进画面，写成简短括注且不带【】标签。
     if req.duration and req.duration > 0:
-        prompt += f"\n【时长校正】本视频实际总时长为 {req.duration} 秒：若上方动作时序写明的总时长与此不符，按 {req.duration} 秒重新匀排各动作节点，禁止提前结束或超时。"
+        prompt += f"\n（全片时长 {req.duration} 秒，动作节奏按 {req.duration} 秒匀速铺排。）"
     if req.plot_data:
         # dynamic=True：名单只约束初始帧，后续人物进出场按走位与镜头运动推演（视频有时间轴，与单帧分镜图不同）
         # 顶层镜头翻译：DeepSeek 按坐标+程序几何事实产出"镜头画面 JSON"（含运动意向），失败自动回退程序直译
-        plot_txt = await build_plot_prompt_text(req.plot_data, req.prompt, dynamic=True)
+        plot_txt = await build_plot_prompt_text(req.plot_data, prompt, dynamic=True)
         if plot_txt:
             prompt = (f"{prompt}\n\n【运动轨迹指令】（由导演定稿的调度图纸坐标翻译而来，"
                       f"人物走位、运动快慢、身体朝向与镜头运动必须严格遵守）\n{plot_txt}\n"
@@ -3414,6 +4843,10 @@ async def generate_video(req: VideoRequest):
                       "严禁把走位路径画成地面上的红色虚线、箭头、标线、跑道线、光轨等任何地面标记——画面是真实世界，不是图纸。"
                       "白底俯视调度图纸类参考图仅用于理解走位方向与机位关系，"
                       "严禁把图纸本身、白底平面图、人偶棋子图标、扇形视锥、虚线箭头画进视频画面。")
+            # 视野外陈设黑名单：同生图链路，防场景设定图里的门窗被视频抄进画面
+            _hn = _hidden_props_note(req.plot_data or {})
+            if _hn:
+                prompt += "\n" + _hn
 
     # 首尾帧过渡自然性（实测：不给过渡指令时，两帧构图差异稍大模型就硬切/让人物凭空出现）
     if frame_mode in ("first", "last", "first_last"):
@@ -3421,7 +4854,8 @@ async def generate_video(req: VideoRequest):
             prompt += ("\n\n【首尾帧过渡规则·最高优先级】首帧是视频第 1 帧，尾帧是最后一帧，中间的全部画面必须从首帧【连续演变】到尾帧：\n"
                        "①首帧里已有的人物全程连续存在——只能通过走位、转身、被镜头摇出画面等方式离开视野，严禁消失后再凭空出现；\n"
                        "②尾帧里有、而首帧里没有的人物或物体，必须用符合物理逻辑的方式带进画面：走入画面边缘、镜头摇/移过去带出、"
-                       "人物从前景走过让出视野等，严禁凭空生成、严禁突然出现在画面中央；名单外的无关人物（路人、旁观者等）除外——他们任何时候都不得出现；\n"
+                       "人物从前景走过让出视野等，严禁凭空生成、严禁突然出现在画面中央；提示词正文明确写到的人物（宫人、路人甲等群演）按正文入画，"
+                       "名单外且正文没写的无名人影任何时候都不得出现；\n"
                        "③首尾帧构图差异（机位朝向、人物站位变化）用连续的镜头运动（摇镜/推拉/跟随/环绕）与连续的人物走位完成，"
                        "中间允许有多个过渡状态，严禁前半段静止在首帧、后半段硬切到尾帧；\n"
                        "④过渡路径优先服从【运动轨迹指令】的走位与镜头运动方向；无轨迹指令时按两帧差异设计最自然的连续运镜；\n"
@@ -3431,7 +4865,8 @@ async def generate_video(req: VideoRequest):
         elif frame_mode == "first":
             prompt += ("\n\n【首帧连续规则】首帧是视频第 1 帧：画面从首帧出发自然连续地动起来，"
                        "首帧里的人物连续存在、连续位移，名单内的新角色必须从画面边缘走入或被镜头运动带进画面，"
-                       "名单外的无关人物（路人、旁观者等）任何时候都不得出现，严禁凭空生成、硬切、瞬移。")
+                       "提示词正文明确写到的人物（宫人、路人甲等群演）按正文入画，"
+                       "名单外且正文没写的无关人物任何时候都不得出现，严禁凭空生成、硬切、瞬移。")
         else:  # last
             prompt += ("\n\n【尾帧收束规则】尾帧是视频最后一帧：画面从初始状态自然连续地演变，最终精确收束到尾帧画面，"
                        "全程人物连续存在、连续位移，新出现的人物/物体必须从画面边缘走入或被镜头运动带进画面，严禁凭空生成、硬切、瞬移。")
@@ -3452,12 +4887,110 @@ async def generate_video(req: VideoRequest):
         prompt += ("\n\n【场景环境锁定·最高优先级】本视频的场景环境、美术风格与光线必须与第1张参考图（本镜头的分镜图）完全一致，"
                    "全程不得切换场景、不得重绘背景：\n" + req.env_context.strip())
 
-    # 出场人物封锁：视频模型（尤其是参考模式）爱往背景里塞路人/旁观者，而剧情里除了写明的角色
-    # 不该有任何人。与「身份唯一规则」互补——那条防复制人，这条防凭空多出的无关人物。
-    prompt += ("\n\n【出场人物封锁·最高优先级】本视频画面中只允许出现提示词与调度名单里写明姓名的角色"
-               "（如「我」、角色设定图里的角色），严禁出现任何其他人物：无名的路人、行人、旁观者、游客、"
-               "背景人群、远处人影、剪影，一个都不许有。背景环境保持空旷，宁可无人也不要编造人物填充画面；"
-               "参考图里没有的人、名单外的人，无论以何种方式（走过、路过、站在远处、只露部分身体）都不得出现在画面任何位置。")
+    # 参考模式一致性锚点：参考图是画面基准而不是"必须是第 1 帧"（用户明确：镜头可以从
+    # 别的画面开始、中途经过与参考图一致的状态，这正是参考模式区别于首帧模式的意义）。
+    # 所以只锁"全程一致性"（场景/风格/光线/人物造型），不锁构图时刻与首帧等同。
+    # 服装以第 1 张（本镜分镜图）为最高基准（用户实测事故：参考池混入角色设定图后，
+    # 模型把设定图的军装和分镜图的便装混着穿——Seedance 对多图服装会自行融合，
+    # 必须逐条点名裁决权，笼统写"与参考图一致"挡不住）。
+    if frame_mode == "reference":
+        prompt += ("\n\n【参考图一致性·服装裁决】人物的外貌、发型与服装以第1张参考图（本镜头分镜图）为最高基准："
+                   "服装的款式、颜色、层数、材质必须与分镜图逐项一致，全程不得更换、增减或叠加任何衣物"
+                   "（如披风、盔甲、外套等分镜图上没有的衣物一律禁止出现）；"
+                   "第1张之后的设定图只用于核对人物面容与发型，其服装与分镜图不一致时一律以分镜图为准；"
+                   "提示词正文明确要求的换装除外。"
+                   "场景环境、美术风格、光线全程与参考图保持一致；"
+                   "构图与时刻可以与参考图不同，运动中经过与参考图一致的画面也允许；"
+                   "严禁换成完全不同的场景、改变人物造型或重绘背景。")
+
+    # 画面纯净（视频专用）：提示词文本被模型当字幕烧进画面的实测事故已多次，
+    # 除本条外，下方还会把全部【】标签整形为括注，从形态上消除"剧本感"。
+    # 视频参考图分工说明（仅参考模式）：前端把视频提示词中括号引用到的角色（含指定服装）/
+    # 场景/道具设定图也放进参考池，这里按序号声明各图用途。写成短括注（无【】标签），
+    # 防模型把它当字幕的同时说明清楚"只锁外观，动作人数以提示词为准"。
+    if req.ref_meta and frame_mode == "reference":
+        notes = []
+        for k, m in enumerate(req.ref_meta[:len(req.image_urls)]):
+            kind = str((m or {}).get("kind") or "")
+            nm = str((m or {}).get("name") or "")
+            if kind in ("character", "scene", "prop") and nm:
+                notes.append(f"第{k + 1}张={nm}设定图")
+        if notes:
+            prompt += ("\n（参考图分工：第1张=本镜分镜图，是服装与场景的最高基准；"
+                       + "、".join(notes) + "，这些图只核对面容/发型，其服装与分镜图不一致时以分镜图为准；"
+                       "人物动作、画面人数以提示词为准。）")
+
+    prompt += "\n\n【画面纯净】成片是纯影视画面：任何文字、数字、水印、界面元素都不得出现在画面中。"
+
+    # ---------- 视频提示词整形（防字幕烧录） ----------
+    # 实测事故：H3 系 i2v 模型会把提示词里的【标签】结构当剧本/台词，挑字烧成画面字幕
+    # （"本视频实际总时长为 5 秒""打开民女打扮""…画面基准"都被渲染过）。
+    # 发送前把全部【】标签转为圆括号、去掉"最高优先级/内部指令"标签语，压掉"剧本感"；
+    # 只影响发给模型的文本，不影响参考图选择（那在提交前已完成）。
+    def _defuse_subtitles(s: str) -> str:
+        s = re.sub(r"【([^】]*)】", r"（\1）", s)
+        s = s.replace("·最高优先级", "").replace("·内部指令", "").replace("最高优先级", "").replace("内部指令", "")
+        s = re.sub(r"\n{2,}", "\n", s)
+        return s.strip()
+
+    prompt = _defuse_subtitles(prompt)
+
+    # 垫参考视频公网化：云端（Ark/AutoDL）无法访问本机/局域网地址，也不接受 base64。
+    # 本地 /static/ 文件一律转成"公网域名+sharecode"直链（优先前端 page_origin，
+    # 兜底后端已知公网域名 PUBLIC_BASE_URL）；data: URI 落盘成本站文件再转直链。
+    if req.ref_video_urls:
+        _pub = []
+        for _u in req.ref_video_urls:
+            _su = str(_u).strip()
+            # data URI（历史遗留/异常入口）：解码落盘到 uploads，转成本站直链
+            if _su.startswith("data:video"):
+                try:
+                    _b64 = _su.split(",", 1)[1] if "," in _su else ""
+                    _vb = base64.b64decode(_b64)
+                    if len(_vb) > 1000:
+                        _vn = f"refvideo_{uuid.uuid4().hex}.mp4"
+                        with open(os.path.join("static", "uploads", _vn), "wb") as _vf:
+                            _vf.write(_vb)
+                        _su = f"/static/uploads/{_vn}"
+                        print(f"💾 垫视频 data URI 落盘: {_vn} ({len(_vb)//1024}KB)")
+                except Exception as _e:
+                    print(f"⚠️ 垫视频 data URI 落盘失败: {type(_e).__name__}")
+            _pu = public_media_url(request, _su, req.share_code, req.page_origin)
+            if not _pu and "/static/" in _su:
+                # 兜底：前端没传 origin（HTML 缓存）或请求头是内网地址时，用后端已知的公网域名拼直链
+                _pu = f"{PUBLIC_BASE_URL}/static/{_su.split('/static/')[-1].split('?')[0]}"
+                if req.share_code:
+                    _pu += f"?sharecode={req.share_code}"
+            if _pu and _pu != _su:
+                print(f"🌐 垫视频公网直链: {_su.split('/')[-1][:40]} → {_pu[:120]}")
+            _pub.append(_pu or _su)
+        req.ref_video_urls = _pub
+
+    # 参考图公网化：官方"信任模型产物"审核以原始产物为准（同账号 30 天内 Seedream 5.0 产物免真人审核），
+    # 文档明确"压缩或转发文件易引发信任失效"——所以方舟引擎优先用公网 URL 直传原始字节，
+    # 让方舟拉到的就是生成时的原始文件；转不出公网地址（本地部署）再回落 base64。
+    def _pub_img(u: str) -> str:
+        _su = str(u).strip()
+        if _su.startswith(("http://", "https://")):
+            return _su
+        _pu = public_media_url(request, _su, req.share_code, req.page_origin)
+        if not _pu and "/static/" in _su:
+            _pu = f"{PUBLIC_BASE_URL}/static/{_su.split('/static/')[-1].split('?')[0]}"
+            if req.share_code:
+                _pu += f"?sharecode={req.share_code}"
+        return _pu or _su
+
+    if req.image_urls:
+        req.image_urls = [_pub_img(u) for u in req.image_urls]
+    if req.first_frame_url:
+        req.first_frame_url = _pub_img(req.first_frame_url)
+    if req.last_frame_url:
+        req.last_frame_url = _pub_img(req.last_frame_url)
+
+    # 引擎分流：doubao=豆包 Seedance（火山方舟）走独立提交通道，不走 AutoDL ComfyUI 工作流
+    if (req.video_engine or "autodl").lower() in ("doubao", "seedance", "ark"):
+        print(f"🫘 视频引擎=豆包 Seedance, 模式={frame_mode}, 垫参考视频={len(req.ref_video_urls or [])}条")
+        return await submit_doubao_video(req, prompt, frame_mode)
 
     target_workflow = req.workflow_id if req.workflow_id else AUTODL_WORKFLOW
 
@@ -3545,6 +5078,13 @@ async def generate_video(req: VideoRequest):
             # zm 系列老工作流不接受 resolution（传了报 RequestParameterIsWrong），保持默认档
             if resolution:
                 p["resolution"] = resolution
+            # 垫参考视频（引导运镜/节奏，不入成片）：ref_video_0..N 传给工作流；
+            # 不支持该参数的工作流（平台报未定义参数）会在提交后去掉重试，不影响生成
+            for i, u in enumerate((req.ref_video_urls or [])[:10]):
+                u = str(u).strip()
+                if not u:
+                    continue
+                p[f"ref_video_{i}"] = u if u.startswith(("http://", "https://")) else local_url_to_data_uri_video(u)
             return p
 
         target_workflow = req.workflow_id if req.workflow_id else AUTODL_WORKFLOW
@@ -3598,6 +5138,13 @@ async def generate_video(req: VideoRequest):
             print("🔄 工作流不接受 resolution 参数，去掉该参数重试（使用工作流默认档位）")
             chosen_res = None
             payload = build_payload(frame_mode in ("first", "first_last"), frame_mode in ("last", "first_last"))
+            resp = await submit(payload)
+            data = resp.json() if resp.status_code == 200 else {}
+        # 垫参考视频兜底：部分工作流不接受 ref_video_* 参数（报未定义参数），去掉后重试
+        if any(k.startswith("ref_video_") for k in payload) and data.get("code") == "RequestParameterIsWrong" \
+                and "ref_video" in (data.get("msg") or ""):
+            print("🔄 工作流不接受垫参考视频（ref_video_*）参数，去掉后重试（垫视频仅作引导，不影响正常生成）")
+            payload = {k: v for k, v in payload.items() if not k.startswith("ref_video_")}
             resp = await submit(payload)
             data = resp.json() if resp.status_code == 200 else {}
         # 首尾帧工作流文档要求 first_frame/last_frame 都必填：
@@ -3665,6 +5212,10 @@ async def generate_video(req: VideoRequest):
 # ---------- 5. AutoDL 查询视频结果 ----------
 @app.get("/api/video-status/{task_id}")
 async def video_status(task_id: str):
+    # doubao: 前缀 = 豆包 Seedance 任务（火山方舟），走 Ark 查询通道
+    if task_id.startswith(DOUBAO_TASK_PREFIX):
+        _require_own_key("ark")
+        return await get_doubao_task(task_id[len(DOUBAO_TASK_PREFIX):])
     _require_own_key("autodl")
     headers = {"Authorization": _eff_key("autodl")}
     try:
@@ -3703,7 +5254,26 @@ class SaveVideoRequest(BaseModel):
 
 @app.post("/api/save-video")
 async def save_video(req: SaveVideoRequest):
-    """把云端生成完成的视频下载到本地持久保存（AutoDL 返回的签名链接会过期）。"""
+    """把云端生成完成的视频下载到本地持久保存（AutoDL/火山方舟返回的签名链接都会过期）。"""
+    # doubao: 前缀 = 豆包 Seedance 任务：先查 Ark 拿成片 URL，再下载落盘
+    if req.task_id.startswith(DOUBAO_TASK_PREFIX):
+        _require_own_key("ark")
+        info = await get_doubao_task(req.task_id[len(DOUBAO_TASK_PREFIX):])
+        if info["status"] not in ("SUCCESS", "COMPLETED", "SUCCEEDED"):
+            raise HTTPException(400, f"任务尚未完成（当前状态：{info['status']}）")
+        video_url = info.get("video_url")
+        if not video_url:
+            raise HTTPException(404, "任务完成但未找到视频文件")
+        async with httpx.AsyncClient(timeout=120) as client:
+            vresp = await client.get(video_url)
+            if vresp.status_code != 200:
+                raise HTTPException(500, "视频下载失败")
+            filename = f"video_{uuid.uuid4().hex}.mp4"
+            filepath = os.path.join("static/uploads", filename)
+            with open(filepath, "wb") as f:
+                f.write(vresp.content)
+        return {"video_url": f"/static/uploads/{filename}"}
+
     _require_own_key("autodl")
     headers = {"Authorization": _eff_key("autodl")}
     async with httpx.AsyncClient(timeout=120) as client:
@@ -4030,13 +5600,66 @@ async def import_project(file: UploadFile = File(...)):
 # ============================================================
 # 手机版新增 1：SQLite 项目持久化层
 # 项目数据不再存浏览器 localStorage（iOS 7 天不访问会被清空），
-# 统一存到服务端硬盘上的 studio.db（一个普通文件，随部署目录持久保存）。
+# 统一存到用户主目录 ~/.anime_studio/studio.db（重发布不会覆盖，见下方数据保护说明）。
 # ============================================================
 import sqlite3
 import time as _time
+import subprocess as _subprocess
 from fastapi.responses import JSONResponse
 
-DB_PATH = os.path.join(os.getcwd(), "studio.db")
+# ============================================================
+# 持久数据保护（2026-11-13 事故修复）：发布平台每次部署会用上传目录整体覆盖线上，
+# 曾把线上新建的项目（studio.db + static/uploads 素材）全部冲掉。
+# 修复：DB 与生成素材一律存到用户主目录 ~/.anime_studio/（沙箱重发布不触碰），
+# 首次运行自动迁入目录内旧数据；static/uploads 用目录链接指过去，代码无需改路径。
+# ============================================================
+_DATA_HOME = os.path.join(os.path.expanduser("~"), ".anime_studio")
+os.makedirs(_DATA_HOME, exist_ok=True)
+
+# --- studio.db：优先主目录；目录内旧库只在没有主目录库时迁入（线上库永不被上传覆盖） ---
+DB_PATH = os.path.join(_DATA_HOME, "studio.db")
+if not os.path.exists(DB_PATH):
+    _legacy_db = os.path.join(os.getcwd(), "studio.db")
+    if os.path.exists(_legacy_db):
+        try:
+            shutil.copy2(_legacy_db, DB_PATH)
+            print(f"[数据保护] 已迁移旧数据库 {_legacy_db} → {DB_PATH}")
+        except Exception as _e:
+            print(f"[数据保护] 旧数据库迁移失败，改用目录内库: {_e}")
+            DB_PATH = _legacy_db
+
+
+def _sync_uploads():
+    """uploads 双向同步（不依赖符号链接，任何环境都可用）：
+    1) 应用目录里主目录没有的文件 → 并入主目录（本次发布上传带来的新文件，线上已有同名文件以线上为准）
+    2) 主目录里应用目录缺的文件 → 补回应用目录（上次运行生成、被发布覆盖掉的素材，恢复可访问）
+    运行期写入仍走应用目录（代码零改动），重启时再并入主目录持久保存。"""
+    home = os.path.join(_DATA_HOME, "uploads")
+    os.makedirs(home, exist_ok=True)
+    app_dir = os.path.join(os.getcwd(), "static", "uploads")
+    os.makedirs(app_dir, exist_ok=True)
+    merged = restored = 0
+    for n in os.listdir(app_dir):
+        dst = os.path.join(home, n)
+        if not os.path.exists(dst):
+            try:
+                shutil.move(os.path.join(app_dir, n), dst)
+                merged += 1
+            except Exception:
+                pass
+    for n in os.listdir(home):
+        dst = os.path.join(app_dir, n)
+        if not os.path.exists(dst):
+            try:
+                shutil.copy2(os.path.join(home, n), dst)
+                restored += 1
+            except Exception:
+                pass
+    print(f"[数据保护] uploads 同步完成：并入 {merged} 个，补回 {restored} 个（主目录: {home}）")
+
+
+_sync_uploads()
+
 ACCESS_CODE = (os.getenv("ACCESS_CODE") or "").strip()  # .env 里配置，未配置则不启用口令
 # 多口令分区：ACCESS_CODES 里每个口令一个独立项目分区（互相不可见）；
 # ACCESS_CODE 为主口令，可见所有分区。示例：ACCESS_CODES=朋友甲的口令,朋友乙的口令
@@ -4109,6 +5732,7 @@ class ProjectCreateRequest(BaseModel):
 class ProjectSaveRequest(BaseModel):
     name: str = "未命名项目"
     data: Dict[str, Any]
+    base_updated_at: int | None = None  # 客户端打开项目/上次保存时拿到的 updated_at（版本戳）
 
 @app.get("/api/projects")
 async def list_projects(request: Request):
@@ -4168,14 +5792,27 @@ def _request_code(request) -> str | None:
 
 @app.post("/api/projects/{pid}")
 async def save_project(pid: str, request: Request, req: ProjectSaveRequest):
-    """前端自动保存入口：整个项目 JSON upsert 进 SQLite。"""
+    """前端自动保存入口：整个项目 JSON upsert 进 SQLite。
+
+    多端同步规则：客户端带 base_updated_at（打开项目/上次保存时的版本戳）。
+    若云端在此之后已被其他设备更新（updated_at 更新），拒绝写入返回 409，
+    客户端据此拉取云端最新版本——保证「后保存的、基于最新版本的数据」生效，
+    旧页面的过期数据永远覆盖不了新数据。
+    """
     now = _time.time()
     blob = json.dumps(req.data, ensure_ascii=False)
     with _db() as conn:
-        r = conn.execute("SELECT id, owner FROM projects WHERE id=?", (pid,)).fetchone()
+        r = conn.execute("SELECT id, owner, updated_at FROM projects WHERE id=?", (pid,)).fetchone()
         if r:
             if not _can_touch(request, r["owner"]):
                 raise HTTPException(404, "项目不存在")
+            server_ms = int(r["updated_at"] * 1000)
+            # 版本冲突：云端比客户端的基准新（留 1 秒容差吸收毫秒取整误差）→ 拒绝覆盖
+            if req.base_updated_at is not None and server_ms > req.base_updated_at + 1000:
+                return JSONResponse(status_code=409, content={
+                    "detail": "项目已在其他设备更新",
+                    "server_updated_at": server_ms,
+                })
             conn.execute("UPDATE projects SET name=?, data=?, updated_at=? WHERE id=?",
                          (req.name, blob, now, pid))
             owner = r["owner"]
@@ -4188,7 +5825,7 @@ async def save_project(pid: str, request: Request, req: ProjectSaveRequest):
 
 # ---------- 删除同步：界面删除图片/视频/项目时，服务器文件一并清理 ----------
 # 命名白名单：只允许删除本应用生成的上传文件（img_/video_/diagram_*），防路径穿越与误删
-_UPLOAD_RE = re.compile(r"^(img|video|diagram_topview|diagram_trajectory|voice|dub)_[0-9a-f]{6,40}\.(jpg|jpeg|png|webp|gif|mp4|wav|mp3|m4a|aac|ogg|flac)$", re.I)
+_UPLOAD_RE = re.compile(r"^(img|video|refvideo|diagram_topview|diagram_trajectory|voice|dub)_[0-9a-f]{6,40}\.(jpg|jpeg|png|webp|gif|mp4|webm|mov|m4v|wav|mp3|m4a|aac|ogg|flac)$", re.I)
 
 def _collect_upload_urls(obj, out):
     """递归收集 JSON 数据里引用的所有 /static/uploads/ 文件 URL"""

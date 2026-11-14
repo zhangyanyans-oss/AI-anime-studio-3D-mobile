@@ -44,6 +44,7 @@ textarea { resize: none; line-height: 1.6; }
 .btn:active { transform: scale(.97); }
 .btn-primary { background: var(--accent); color: #fff; box-shadow: 0 4px 14px rgba(79,70,229,.25); }
 .btn-ghost { background: var(--accent-soft); color: var(--accent-ink); }
+.btn-au { background: #eef2ff; color: #6366f1; border: 1px solid #c7d2fe; }
 .btn-danger { background: var(--danger-soft); color: var(--danger); }
 .btn-block { width: 100%; margin-top: 12px; }
 .btn-sm { padding: 8px 12px; font-size: 13px; border-radius: 10px; }
@@ -189,8 +190,49 @@ textarea { resize: none; line-height: 1.6; }
 .chat-msg.ai .bubble { background: var(--card); border: 1px solid var(--line); border-top-left-radius: 4px; }
 .chat-msg.user .bubble { background: var(--accent); color: #fff; border-top-right-radius: 4px; }
 .bubble img { max-width: 200px; border-radius: 10px; display: block; margin-top: 6px; }
+/* 多图九宫格缩略展示 */
+.bubble .chat-imgs {
+  display: grid; grid-template-columns: repeat(3, 1fr); gap: 4px;
+  margin-top: 6px; max-width: 240px;
+}
+.bubble .chat-imgs img {
+  width: 100%; max-width: none; height: 76px; object-fit: cover;
+  border-radius: 8px; margin-top: 0;
+}
 .bubble p { margin: 0 0 6px; } .bubble p:last-child { margin-bottom: 0; }
-.bubble ul, .bubble ol { margin: 4px 0 6px 18px; }
+.bubble ul, .bubble ol { margin: 4px 0 6px; padding-left: 18px; }
+.bubble li { margin: 2px 0; } .bubble li > p { margin: 0; }
+.bubble li::marker { color: var(--accent); }
+
+/* ---------- 气泡内 Markdown 元素 ---------- */
+.bubble a { color: var(--accent); text-decoration: underline; word-break: break-all; }
+.bubble strong { font-weight: 700; }
+.bubble h1, .bubble h2, .bubble h3, .bubble h4 { margin: 8px 0 4px; line-height: 1.4; }
+.bubble h1 { font-size: 17px; }
+.bubble h2 { font-size: 16px; }
+.bubble h3, .bubble h4 { font-size: 15px; }
+.bubble > h1:first-child, .bubble > h2:first-child, .bubble > h3:first-child { margin-top: 0; }
+.bubble code {
+  font-family: ui-monospace, SFMono-Regular, Consolas, "Courier New", monospace;
+  font-size: 12.5px; background: rgba(79,70,229,.08); color: #4338ca;
+  padding: 1px 5px; border-radius: 5px; word-break: break-all;
+}
+.bubble pre {
+  background: #1e1b2e; color: #e2e0f0; border-radius: 10px;
+  padding: 10px 12px; margin: 6px 0; overflow-x: auto;
+  font-size: 12px; line-height: 1.5;
+}
+.bubble pre code { background: none; color: inherit; padding: 0; font-size: 12px; word-break: normal; }
+.bubble blockquote {
+  margin: 6px 0; padding: 2px 10px; border-left: 3px solid var(--accent);
+  background: var(--accent-soft); border-radius: 0 8px 8px 0; color: #4b5563;
+}
+.bubble blockquote p { margin: 4px 0; }
+.bubble hr { border: none; border-top: 1px solid var(--line); margin: 8px 0; }
+.bubble .md-table-wrap { overflow-x: auto; margin: 6px 0; -webkit-overflow-scrolling: touch; }
+.bubble table { border-collapse: collapse; font-size: 12.5px; }
+.bubble th, .bubble td { border: 1px solid var(--line); padding: 5px 9px; text-align: left; }
+.bubble th { background: var(--accent-soft); font-weight: 600; white-space: nowrap; }
 .ready-banner {
   margin: 0 14px 8px; padding: 12px 14px; border-radius: 14px;
   background: #e7f8f0; color: #0d7a52; font-size: 13.5px; font-weight: 600;
@@ -314,6 +356,59 @@ textarea { resize: none; line-height: 1.6; }
 .sheet-img-preview { width: 100%; border-radius: 14px; margin-bottom: 12px; display: block; }
 .field-label { display: block; font-size: 13px; font-weight: 600; color: #3c3f47; margin: 12px 0 6px; }
 
+/* ---------- 提示词高亮框：参数标签加粗加黑，资产引用做彩色胶囊 ----------
+   目的：AI 写出来的【景别：中景】【镜头细节】和中括号引用的【木兰·民女打扮】
+   长得一样，光看分不清哪个会去调设定图。加粗+彩色两套样式直接区分开。 */
+.pbox-view {
+  border: 1.5px solid var(--line); border-radius: 12px;
+  padding: 12px 14px; background: #fff;
+  font-size: 15px; line-height: 1.6; color: var(--ink);
+  white-space: pre-wrap; word-break: break-word; overflow-wrap: anywhere;
+  max-height: 46vh; overflow-y: auto; -webkit-overflow-scrolling: touch;
+}
+.pbox-view .p-tag { font-weight: 800; color: #0f1222; }        /* 镜头参数/段落标签：加黑 */
+.pbox-view .p-ref {                                             /* 人物/场景/道具引用：彩色胶囊 */
+  background: var(--accent-soft); color: var(--accent-ink);
+  border-radius: 6px; padding: 0 4px; font-weight: 600;
+  box-decoration-break: clone; -webkit-box-decoration-break: clone;
+}
+.pbox-view .p-empty { color: var(--muted); font-size: 14px; }
+.pbox-hint {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  margin: 5px 2px 0; font-size: 11.5px; color: var(--muted);
+}
+.pbox-edit {
+  flex: none; padding: 3px 10px; border-radius: 999px;
+  background: var(--accent-soft); color: var(--accent-ink);
+  font-size: 12px; font-weight: 600;
+}
+.pbox-edit:active { opacity: .7; }
+
+/* ---------- 🧭 一键检测冲突（提示词 vs 调度图/3D导演台坐标事实） ---------- */
+.conflict-legend {
+  margin: 8px 0 6px; padding: 7px 10px; border-radius: 9px;
+  background: var(--accent-soft); color: var(--accent-ink); font-size: 12px; line-height: 1.5;
+}
+.conflict-ok {
+  padding: 9px 11px; border-radius: 10px; font-size: 13px; font-weight: 600;
+  background: rgba(23, 160, 109, .1); color: var(--ok, #17a06d); border: 1px solid rgba(23, 160, 109, .35);
+}
+.conflict-count { margin: 6px 0 8px; font-size: 12.5px; color: var(--ink); }
+.conflict-item {
+  margin: 7px 0; padding: 9px 11px; border-radius: 10px; font-size: 12.5px; line-height: 1.55;
+  background: #fbfbff; border: 1px solid var(--line);
+}
+.conflict-item.sev-high   { border-color: rgba(229, 72, 77, .45);  background: var(--danger-soft); }
+.conflict-item.sev-medium { border-color: rgba(217, 149, 22, .4);  background: #fdf6e8; }
+.conflict-item.sev-info   { border-color: rgba(120, 130, 150, .3); background: #f6f7fa; }
+.ci-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 5px; font-size: 13px; }
+.ci-scope { font-size: 11px; color: var(--muted); }
+.ci-row { display: flex; gap: 6px; margin-top: 3px; color: var(--ink); }
+.ci-k {
+  flex: none; width: 44px; text-align: center; font-size: 10.5px; font-weight: 700;
+  color: var(--muted); background: rgba(120,130,150,.12); border-radius: 5px; padding: 1px 0; height: fit-content;
+}
+
 /* ---------- 画面参数下拉（景别/景深/机位/焦段/构图/光线/运镜） ---------- */
 .param-grid {
   display: grid; grid-template-columns: repeat(auto-fit, minmax(92px, 1fr));
@@ -398,9 +493,8 @@ textarea { resize: none; line-height: 1.6; }
 .masked-list b { color: #3c3f47; font-weight: 600; }
 
 /* ---------- 分镜工具栏 / 调度图 ---------- */
+/* 不吸顶：跟着页面一起滚走（吸顶时往下翻分镜，这条工具条一直挡在屏幕顶端） */
 .boards-toolbar {
-  position: sticky; top: 0; z-index: 5;
-  background: linear-gradient(var(--bg) 82%, transparent);
   padding: 8px 2px 0;
   margin: -6px 0 2px;
 }
@@ -537,6 +631,21 @@ body.board-drag-noselect, body.board-drag-noselect * { user-select: none !import
   border-radius: 12px; padding: 6px 8px;
 }
 .dub-item audio { flex: 1; height: 34px; min-width: 0; }
+/* 垫参考视频列表（视频弹窗内）：缩略图 + 名称 + 删除 */
+.rv-list { display: flex; flex-direction: column; gap: 8px; }
+.rv-item {
+  display: flex; align-items: center; gap: 8px;
+  background: var(--accent-soft, #f1f3ff); border: 1px solid var(--line);
+  border-radius: 12px; padding: 6px 8px;
+}
+.rv-item video {
+  width: 76px; height: 44px; object-fit: cover; border-radius: 8px;
+  background: #000; flex-shrink: 0; display: block;
+}
+.rv-name {
+  flex: 1; min-width: 0; font-size: 12px; color: var(--ink, #1e293b);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
 .dub-tag {
   font-size: 11px; padding: 3px 8px; border-radius: 999px;
   background: var(--accent-ink, #4f46e5); color: #fff; white-space: nowrap;

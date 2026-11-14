@@ -147,6 +147,120 @@ AU_SETS = [
      "keywords": ["害羞", "脸红", "羞涩", "羞怯", "shy", "blushing", "bashful", "flustered"]},
     {"au": "无AU激活", "label": "面无表情/冷漠（脸部肌肉放松）",
      "keywords": ["面无表情", "冷漠", "无表情", "呆滞", "放空", "淡漠", "expressionless", "blank", "numb", "stoic"]},
+
+    # ===== v2 扩充（2026-11-13）：补齐常见情绪词 + 复合情绪 =====
+    # 用户反馈"分析不到全部词语"（例：焦急、着急、焦灼 全漏）。原词库条目偏少，
+    # 一个词没收录就整条漏掉。以下按情绪族补齐同义/成语写法；复合情绪单独给组合
+    # AU，让一句话里的多个表情同时命中、AU 叠加。关键词只放"不可能是外貌服饰"的词。
+    # --- 焦急 / 急躁 ---
+    {"au": "AU4+AU20+AU7", "label": "焦急（皱眉+唇绷直+眼紧）",
+     "keywords": ["焦急", "着急", "焦灼", "焦躁", "心焦", "急得", "急不可耐", "着急地",
+                  "anxious", "anxiously", "agitated", "fretful"]},
+    {"au": "AU4+AU20+AU26", "label": "心急如焚/坐立不安",
+     "keywords": ["心急如焚", "心急火燎", "坐立不安", "坐卧不宁", "火烧眉毛", "寝食难安",
+                  "restless", "fidgety", "on pins and needles"]},
+    {"au": "AU2+AU5+AU25", "label": "迫不及待",
+     "keywords": ["迫不及待", "急不可待", "恨不得", "催促", "impatient", "eagerly"]},
+    {"au": "AU4+AU9+AU10", "label": "烦躁/不耐烦",
+     "keywords": ["烦躁", "不耐烦", "心烦", "恼火地", "焦躁不安", "irritated", "impatient", "annoyed"]},
+    {"au": "AU4+AU1+AU20", "label": "心慌/慌乱",
+     "keywords": ["心慌", "慌乱", "慌张", "慌了", "六神无主", "手忙脚乱", "flustered", "panicked"]},
+    # --- 专注 / 紧绷 / 隐忍 ---
+    {"au": "AU4+AU7+AU23", "label": "专注/凝神（眉压+眼睑收紧+唇紧）",
+     "keywords": ["专注", "凝神", "全神贯注", "聚精会神", "屏息", "凝望", "认真",
+                  "focused", "concentrating", "attentive"]},
+    {"au": "AU20+AU24+AU4", "label": "紧张/局促（唇绷直+抿嘴+眉压）",
+     "keywords": ["紧张", "紧绷", "局促", "手足无措", "心跳加速", "攥紧", "捏紧",
+                  "tense", "nervous", "on edge"]},
+    {"au": "AU23+AU24+AU4", "label": "隐忍/克制情绪",
+     "keywords": ["隐忍", "克制", "强忍着", "绷着", "压抑", "忍耐", "restrained", "holding back"]},
+    {"au": "AU4+AU7", "label": "警惕/防备",
+     "keywords": ["警惕", "防备", "警觉", "戒备", "提防", "alert", "on guard", "vigilant"]},
+    {"au": "AU4+AU17+AU23", "label": "坚毅/决绝",
+     "keywords": ["坚毅", "坚决", "决绝", "坚定", "毅然", "下定决心", "resolute", "determined"]},
+    {"au": "AU4+AU5+AU23", "label": "狠厉/戾气",
+     "keywords": ["狠厉", "发狠", "戾气", "狠戾", "杀气", "menacing", "ruthless"]},
+    {"au": "AU43(半闭)+AU7", "label": "疲惫/倦怠",
+     "keywords": ["疲惫", "疲倦", "倦怠", "累极了", "憔悴", "exhausted", "weary", "fatigued"]},
+    # --- 犹豫 / 为难 / 欲言又止 ---
+    {"au": "AU4+AU25+AU24", "label": "犹豫/迟疑",
+     "keywords": ["犹豫", "迟疑", "踌躇", "举棋不定", "拿不定主意", "hesitant", "hesitating"]},
+    {"au": "AU25+AU24+AU17", "label": "欲言又止/说不出口",
+     "keywords": ["欲言又止", "欲语还休", "欲说还休", "话到嘴边", "张了张嘴",
+                  "speechless", "at a loss for words"]},
+    {"au": "AU1+AU4+AU15", "label": "为难/无奈",
+     "keywords": ["为难", "无奈", "无可奈何", "没有办法", "helpless", "resigned"]},
+    # --- 出神 / 垂眸 ---
+    {"au": "AU43(半闭)+无AU激活", "label": "出神/发呆/恍惚",
+     "keywords": ["出神", "发呆", "失神", "恍惚", "怔怔", "愣神", "发愣", "走神", "木然",
+                  "spaced out", "dazed", "lost in thought", "trance"]},
+    {"au": "AU43+AU54", "label": "垂眸/垂眼",
+     "keywords": ["垂眸", "垂下眼帘", "垂下眼睛", "半垂着眼", "眼帘低垂", "eyes lowered"]},
+    # --- 思念 / 惆怅 / 失落 ---
+    {"au": "AU1+AU4+AU54", "label": "思念/怀念（眉内侧上抬+垂眸）",
+     "keywords": ["思念", "怀念", "想念", "思乡", "乡愁", "追忆", "longing", "nostalgic"]},
+    {"au": "AU1+AU4+AU15", "label": "惆怅/怅然",
+     "keywords": ["惆怅", "怅然", "怅惘", "落寞", "空落落", "wistful", "forlorn"]},
+    {"au": "AU1+AU4+AU15+AU54", "label": "失落/消沉",
+     "keywords": ["失落", "消沉", "颓丧", "萎靡", "心灰意冷", "downcast", "crestfallen"]},
+    # --- 复合情绪（两种情绪交叠的写法，以前最容易整条漏掉）---
+    {"au": "AU1+AU2+AU5+AU12", "label": "又惊又喜（惊+笑叠加）",
+     "keywords": ["又惊又喜", "惊喜交加", "喜出望外", "惊喜", "pleasantly surprised", "delighted surprise"]},
+    {"au": "AU12+AU15", "label": "哭笑不得",
+     "keywords": ["哭笑不得", "啼笑皆非", "不知该哭还是该笑", "not know whether to laugh or cry"]},
+    {"au": "AU1+AU4+AU12+AU15", "label": "悲喜交加/百感交集",
+     "keywords": ["悲喜交加", "百感交集", "五味杂陈", "感慨万千", "千言万语", "mixed feelings", "bittersweet"]},
+    {"au": "AU12+AU15", "label": "强颜欢笑（笑里带悲）",
+     "keywords": ["强颜欢笑", "强作欢笑", "强挤出笑", "挤出笑容", "勉强地笑", "forced smile", "fake smile"]},
+    {"au": "AU12+AU7", "label": "皮笑肉不笑/假笑",
+     "keywords": ["皮笑肉不笑", "假笑", "敷衍地笑", "僵笑", "plastic smile", "false smile"]},
+    {"au": "AU12(单侧)+AU7", "label": "似笑非笑",
+     "keywords": ["似笑非笑", "半笑不笑", "笑意不达眼底", "笑而不语", "half-smile", "tight smile"]},
+    {"au": "AU4+AU12(单侧)", "label": "怒极反笑",
+     "keywords": ["怒极反笑", "气极反笑", "气得笑了", "laughing in anger"]},
+    {"au": "AU12+AU25+AU6", "label": "忍俊不禁/噗嗤一笑",
+     "keywords": ["忍俊不禁", "噗嗤", "扑哧", "憋不住笑", "cant help laughing", "burst into laughter"]},
+    {"au": "AU1+AU4+AU15+AU24", "label": "神色复杂/表情复杂",
+     "keywords": ["神色复杂", "表情复杂", "神情复杂", "复杂的神情", "难以言喻", "complicated expression"]},
+    # --- 愧疚 / 心虚 / 哀求 ---
+    {"au": "AU1+AU4+AU54+AU24", "label": "愧疚/自责",
+     "keywords": ["愧疚", "自责", "内疚", "抱歉", "歉意", "懊悔", "悔恨",
+                  "guilty", "remorseful", "regretful", "ashamed"]},
+    {"au": "AU7+AU57/AU58", "label": "心虚/躲闪（眼神飘开）",
+     "keywords": ["心虚", "躲闪", "眼神闪躲", "不敢对视", "移开视线", "guilty look", "shifty"]},
+    {"au": "AU25+AU17", "label": "哀求/恳求",
+     "keywords": ["哀求", "恳求", "央求", "乞求", "求求", "begging", "pleading", "imploring"]},
+    # --- 期待 / 欣慰 / 兴奋 ---
+    {"au": "AU2+AU5+AU12", "label": "期待/憧憬",
+     "keywords": ["期待", "憧憬", "盼望", "神往", "眼前一亮", "hopeful", "expectant"]},
+    {"au": "AU6+AU12+AU43(半闭)", "label": "欣慰",
+     "keywords": ["欣慰", "满足地", "心头一暖", "gratified", "warm satisfaction"]},
+    {"au": "AU12+AU6+AU5", "label": "眼睛发亮/眼中有光",
+     "keywords": ["眼睛发亮", "眼中有光", "双眼放光", "眼睛一亮", "eyes lit up", "sparkling eyes"]},
+    {"au": "AU5+AU2+AU26", "label": "兴奋/亢奋",
+     "keywords": ["兴奋", "亢奋", "激动", "雀跃", "兴致勃勃", "excited", "thrilled", "elated"]},
+    # --- 癫狂 / 阴冷 / 讥讽 ---
+    {"au": "AU5+AU12+AU27", "label": "癫狂/疯狂大笑",
+     "keywords": ["癫狂", "狂笑", "歇斯底里", "发疯", "hysterical", "maniacal", "crazed"]},
+    {"au": "AU7+AU4+AU14", "label": "阴冷/邪魅",
+     "keywords": ["阴冷", "邪魅", "阴鸷", "森然", "阴森", "sinister", "dark smirk"]},
+    {"au": "AU12(单侧)+AU14+AU7", "label": "讥讽/嘲讽",
+     "keywords": ["讥讽", "嘲讽", "嗤笑", "哂笑", "讥笑", "scoff", "mock", "derisive"]},
+    {"au": "AU2+AU12(单侧)+AU53", "label": "挑衅/张扬",
+     "keywords": ["挑衅", "示威", "桀骜", "张狂", "provocative", "defiant", "cocky"]},
+    # --- 补充微动作 / 状态 ---
+    {"au": "AU1+AU4+AU15+AU25", "label": "哽咽/声音发颤",
+     "keywords": ["哽咽", "嗓音发颤", "声音发颤", "泣不成声", "choked up", "voice trembling"]},
+    {"au": "AU6+AU25", "label": "叹气/轻叹",
+     "keywords": ["叹气", "轻叹", "长叹", "叹了口气", "sigh", "sighing"]},
+    {"au": "AU17+AU24", "label": "撇嘴/不以为然",
+     "keywords": ["撇嘴", "撇了撇嘴", "不以为然", "嗤之以鼻", "dismissive", "scoffing"]},
+    {"au": "AU25+AU26+AU27", "label": "倒吸一口气/张口结舌",
+     "keywords": ["倒吸一口气", "倒抽冷气", "张口结舌", "结结巴巴", "gasp", "flabbergasted"]},
+    {"au": "无AU激活+AU43(半闭)", "label": "麻木/漠然",
+     "keywords": ["麻木", "漠然", "无动于衷", "空洞的眼神", "empty stare", "apathetic"]},
+    {"au": "AU7+AU4+AU24", "label": "审视/打量",
+     "keywords": ["打量", "端详", "审视着", "上下打量", "scrutinize", "sizing up"]},
 ]
 
 # ---------- 微表情控制小贴士（参考《80个表情包AI提示词》方法论，已剔除脸型/外貌内容） ----------
@@ -182,20 +296,41 @@ def extract_aus(text: str) -> dict:
 
     # 先剔除叙事基调短语（如 style_bible 里的"自嘲式幽默"），再做表情匹配
     t = _TONE_STRIP_RE.sub("", text.lower())
-    hits = []
+
+    # 1) 先收集全部候选命中
+    cands = []
     for item in AU_SETS:
         matched = [kw for kw in item["keywords"] if kw.lower() in t]
         if matched:
-            hits.append({
-                "au": item["au"],
-                "label": item["label"],
-                "keywords": matched[:4],  # 展示前几个命中词即可
-                "_score": len(matched),
-            })
+            cands.append((item, matched))
 
-    # 命中词多的排前面，最多展示 8 组，避免列表爆炸
-    hits.sort(key=lambda x: -x["_score"])
-    hits = hits[:8]
+    # 2) 长词吃掉短词：「坐立不安」命中了，就不再单独算一条「不安」，
+    #    否则一句话会被拆成一堆重复的短碎词，看着像"分析重复"而不是"分析不全"
+    all_kw = {kw for _, ms in cands for kw in ms}
+    def _covered(kw: str) -> bool:
+        return any(kw != o and kw in o for o in all_kw)
+
+    hits, seen_key = [], set()
+    max_kw = 6        # 每条最多展示 6 个命中词（一句话里常常写了好几个同义表达）
+    max_groups = 14   # 最多展示 14 组（用户反馈"只分析到一部分"，不要再截太狠）
+    for item, matched in cands:
+        kept = [kw for kw in matched if not _covered(kw)]
+        if not kept:
+            continue
+        key = (item["au"], item["label"])
+        if key in seen_key:      # 词库扩充后可能存在同 AU 同标签的重复条目
+            continue
+        seen_key.add(key)
+        hits.append({
+            "au": item["au"],
+            "label": item["label"],
+            "keywords": kept[:max_kw],
+            "_score": len(kept),
+        })
+
+    # 命中词多的排前面（长词/精确词优先展示），再按顺序截断
+    hits.sort(key=lambda x: (-x["_score"], len(x["label"])))
+    hits = hits[:max_groups]
     for h in hits:
         h.pop("_score", None)
 

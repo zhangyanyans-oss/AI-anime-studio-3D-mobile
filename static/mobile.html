@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, user-scalable=no">
 <meta name="theme-color" content="#4f46e5">
 <title>AI 动画工作台 · 手机版</title>
-<link rel="stylesheet" href="/static/mobile.css?v=22">
+<link rel="stylesheet" href="/static/mobile.css?v=29">
 <script type="importmap">
 {
   "imports": {
@@ -14,7 +14,7 @@
   }
 }
 </script>
-<script type="module" src="/static/director3d.js?v=15"></script>
+<script type="module" src="/static/director3d.js?v=20"></script>
 <script src="/static/vendor/marked.min.js"></script>
 <script src="/static/vendor/purify.min.js"></script>
 </head>
@@ -116,7 +116,7 @@
           故事要素齐了！<button class="btn btn-primary" onclick="genStoryFromChat()">生成剧本 →</button>
         </div>
         <div class="chat-input-row">
-          <label class="attach-btn">📷<input id="chat-file" type="file" accept="image/*" capture="environment" hidden onchange="onChatImage(this)"></label>
+          <label class="attach-btn">📷<input id="chat-file" type="file" accept="image/*" multiple hidden onchange="onChatImage(this)"></label>
           <input id="chat-input" type="text" placeholder="说说你的想法…">
           <button class="send-btn" id="chat-send" onclick="sendChat()">➤</button>
         </div>
@@ -201,7 +201,7 @@
       </div>
       <div class="card pad">
         <div class="sec-title">视频模型 <span class="sec-hint">多图参考＝把分镜图/调度图/角色场景图一起给 AI 作参考；首尾帧＝画面从分镜图出发、最后收回到分镜图</span></div>
-        <select id="set-workflow" onchange="saveVideoWorkflow()">
+        <select id="set-workflow" onchange="saveVideoWorkflow(this)">
           <option value="">默认 · H3升级画质（多图参考 zm_u24）</option>
           <optgroup label="多图参考 · 上传分镜图/角色/场景图作参考">
             <option value="minimax_h3_zm_u30">多图参考 · H3超清画质（细节更好，稍慢稍贵）</option>
@@ -213,6 +213,9 @@
           </optgroup>
           <optgroup label="首尾帧 · 以分镜图为起点和终点">
             <option value="minimax_h3_lightx2v">首尾帧 · H3首尾帧生成视频</option>
+          </optgroup>
+          <optgroup label="豆包 Seedance · 火山方舟（用即梦 ARK Key）">
+            <option value="doubao:doubao-seedance-2-5-260628">Seedance 2.5 · 多参考图+垫视频+含音频（4-30秒）</option>
           </optgroup>
         </select>
       </div>
@@ -289,9 +292,9 @@
 </div>
 
 <div id="toast" class="toast hidden"></div>
-<input id="ref-file-input" type="file" accept="image/*" multiple hidden onchange="onRefImages(this)">
+<input id="ref-file-input" type="file" accept="image/*" multiple hidden onchange="onRefFilePicked(this)">
 <input id="voice-file-input" type="file" accept="audio/*" hidden onchange="onVoiceAudio(this)">
 
-<script src="/static/app.js?v=57"></script>
+<script src="/static/app.js?v=109"></script>
 </body>
 </html>

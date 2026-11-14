@@ -4,6 +4,19 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>AI 动画工作台 · 3D 导演台</title>
+    <script>
+    /* 线上发布域名下强制跳转手机版（云端数据版）：
+       桌面版把项目存在浏览器 localStorage，与云端库互不相通——
+       在线上链接上打开会造成"同一个项目两份数据"。
+       本地使用（localhost / 127.0.0.1 / file://）不受影响。 */
+    (function () {
+        var h = location.hostname;
+        var isLocal = h === "localhost" || h === "127.0.0.1" || h === "" || location.protocol === "file:";
+        if (!isLocal && /workbuddy\.host$/.test(h)) {
+            location.replace("/" + location.search);
+        }
+    })();
+    </script>
     <script type="importmap">
     {
         "imports": {
@@ -12,7 +25,7 @@
         }
     }
     </script>
-    <script type="module" src="/static/director3d.js?v=15"></script>
+    <script type="module" src="/static/director3d.js?v=20"></script>
     <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/dompurify@3.0.6/dist/purify.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/sortablejs@1.15.0/Sortable.min.js"></script>
@@ -207,15 +220,30 @@
                             <option value="minimax_h3_image_audio_to_video_v2" data-kind="audio" disabled>H3多图多音频生视频 · 最多9图3音频</option>
                             <option value="minimax_h3_z0903" data-kind="audio" disabled>H3九图三音生视频(高质量音画融合)</option>
                         </optgroup>
+                        <optgroup label="🫘 豆包 Seedance（火山方舟 Ark · 用即梦 ARK Key）">
+                            <option value="doubao:doubao-seedance-2-5-260628" data-kind="doubao">Seedance 2.5 · 多参考图+垫视频+含音频 · 4-30s</option>
+                        </optgroup>
                         <optgroup label="其他">
                             <option value="custom" data-kind="custom">✏️ 自定义工作流 ID…</option>
                         </optgroup>
                     </select>
                     <input type="text" id="i2vWorkflowInput" class="hidden" value="minimax_h3_lightx2v" placeholder="输入工作流 ID" style="width: 220px;" onchange="saveCurrentProject()">
-                    <label style="cursor: pointer; white-space: nowrap; font-size: 14px; display:flex; align-items:center; gap:4px;" title="视频时长（秒），1-15；不同工作流支持的档位不同，超范围会被平台拒绝">⏱️ <input type="number" id="videoDurationInput" min="1" max="15" value="5" style="width: 58px; padding: 4px 6px;" onchange="onDurationChange()"> 秒</label>
+                    <label style="cursor: pointer; white-space: nowrap; font-size: 14px; display:flex; align-items:center; gap:4px;" title="豆包 Seedance 分辨率：480p≈0.7元/秒，720p≈1.5元/秒，1080p≈1.7元/秒（仅豆包引擎生效）">🎞️ <select id="doubaoResSelect" onchange="localStorage.setItem('wb_doubao_res', this.value)" style="padding: 4px 6px;"><option value="480p">480p</option><option value="720p">720p</option><option value="1080p">1080p</option></select></label>
+                    <label style="cursor: pointer; white-space: nowrap; font-size: 14px; display:flex; align-items:center; gap:4px;" title="视频时长（秒），1-30；豆包 Seedance 引擎支持 4-30 秒，AutoDL 工作流建议 1-15 秒（超范围会被平台拒绝）">⏱️ <input type="number" id="videoDurationInput" min="1" max="30" value="5" style="width: 58px; padding: 4px 6px;" onchange="onDurationChange()"> 秒</label>
                 </div>
                 <div class="hint" id="videoModeHint" style="margin-top: 6px;">AI 参考分镜图"自由发挥"演一段：角色长相、服装、场景会跟着参考图走，但动作大、构图和画风可能变化。适合需要明显动态的镜头。</div>
                 <div class="hint hidden" id="i2vHint" style="margin-top: 6px;">分镜图作为视频的起始帧（首帧）或结束帧（尾帧）原样出现，一致性最高。可在下拉里切换首尾帧工作流，或选"自定义"手动填 ID。</div>
+                <!-- 垫参考视频：仅豆包 Seedance 引擎消费（reference_video，引导运镜/构图/节奏，不入成片）；支持上传与外链，可逐条删除 -->
+                <div id="refVideoBar" style="display:flex; align-items:flex-start; gap:10px; flex-wrap:wrap; margin-top:8px; padding-top:8px; border-top:1px dashed var(--border-color);">
+                    <span style="font-size:14px; white-space:nowrap; padding-top:4px;">🎞️ 垫参考视频：</span>
+                    <div id="refVideoList" style="display:flex; gap:10px; flex-wrap:wrap; flex:1; min-width:200px;"></div>
+                    <div style="display:flex; gap:8px; flex-wrap:wrap;">
+                        <input type="file" id="refVideoUploadInput" accept="video/mp4,video/webm,video/quicktime" style="display:none;" onchange="handleRefVideoUpload(event)">
+                        <label for="refVideoUploadInput" class="label-upload" style="cursor:pointer;">➕ 上传视频</label>
+                        <button class="btn-sm" onclick="addRefVideoUrl()">🔗 添加链接</button>
+                    </div>
+                </div>
+                <div class="hint" id="refVideoHint" style="margin-top:4px;">可选：给 AI 垫一段参考视频，引导运镜/构图/节奏（不会出现在成片里）。最多 10 条，单条建议 ≤100MB；不支持垫视频的工作流会自动忽略并照常生成。</div>
             </div>
 
             <div class="section">
@@ -524,6 +552,7 @@
             if (modeRadio) modeRadio.checked = true;
             if (currentData.videoDuration) document.getElementById("videoDurationInput").value = currentData.videoDuration;
             onVideoModeChange();
+            renderRefVideos(); // 恢复本项目垫参考视频列表
             document.getElementById("ideaInput").value = currentData.idea;
             document.getElementById("chatContainer").innerHTML = "";
             
@@ -2707,15 +2736,20 @@
             const sel = document.getElementById("workflowSelect");
             return sel.value === "custom" ? document.getElementById("i2vWorkflowInput").value.trim() : sel.value;
         }
-        // 视频时长：读取输入框并钳制到 1-15 秒（各工作流支持的档位不同，平台会二次校验）
+        // 视频时长：读取输入框并钳制（豆包引擎 4-30 秒，AutoDL 建议不超过 15 秒，平台会二次校验）
         function getVideoDuration() {
             const el = document.getElementById("videoDurationInput");
             let v = parseInt(el && el.value, 10);
             if (!v || v < 1) v = 5;
-            if (v > 15) v = 15;
+            if (v > 30) v = 30;
             if (el) el.value = v;
             return v;
         }
+        // 豆包分辨率下拉：回显上次选择（480p 默认最省钱）
+        (function () {
+            const el = document.getElementById("doubaoResSelect");
+            if (el) el.value = localStorage.getItem("wb_doubao_res") || "480p";
+        })();
         function onDurationChange() {
             getVideoDuration();
             saveCurrentProject();
@@ -2733,6 +2767,77 @@
             if (kind === "custom") document.getElementById("i2vWorkflowInput").focus();
             onVideoModeChange(); // 统一刷新提示、联动与保存
         }
+
+        // ================= 垫参考视频（豆包 Seedance reference_video）：新增 / 删除 =================
+        // 列表随项目持久化（currentData.refVideos = [{url, name}]），提交生视频时随 body 传给后端
+        function renderRefVideos() {
+            const list = document.getElementById("refVideoList");
+            if (!list) return;
+            const items = currentData.refVideos || [];
+            if (!items.length) {
+                list.innerHTML = `<span class="hint" style="padding-top:4px;">还没有垫参考视频（可选，仅「🫘 豆包 Seedance」引擎使用）</span>`;
+                return;
+            }
+            list.innerHTML = items.map((v, i) => `
+                <div style="position:relative; display:inline-block; text-align:center;">
+                    <video src="${v.url}" muted preload="metadata" style="height:64px; border-radius:6px; border:1px solid var(--border-color); display:block; background:#000;"></video>
+                    <div class="hint" style="max-width:130px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="${v.name || ""}">${v.name || "参考视频"}</div>
+                    <button class="btn-del-item" style="position:absolute; top:4px; right:4px; padding:1px 6px;" title="移除该参考视频" onclick="removeRefVideo(${i})">✕</button>
+                </div>`).join("");
+        }
+        async function handleRefVideoUpload(ev) {
+            const f = ev.target.files[0];
+            if (!f) return;
+            if (f.size > 100 * 1024 * 1024) { alert("参考视频过大（超过 100MB），请压缩后再上传。"); ev.target.value = ""; return; }
+            const log = document.getElementById("refVideoHint");
+            log.textContent = `⏳ 正在上传「${f.name}」（${(f.size / 1024 / 1024).toFixed(1)}MB），请稍候…`;
+            const reader = new FileReader();
+            reader.onload = async () => {
+                try {
+                    const r = await fetch(`${API}/api/upload-ref-video`, {
+                        method: "POST", headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ video_base64: reader.result, filename: f.name }),
+                    });
+                    if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || "上传失败");
+                    const d = await r.json();
+                    if (!currentData.refVideos) currentData.refVideos = [];
+                    if (currentData.refVideos.length >= 10) { alert("最多垫 10 条参考视频，请先删除一条。"); ev.target.value = ""; return; }
+                    currentData.refVideos.push({ url: d.video_url, name: f.name });
+                    saveCurrentProject();
+                    renderRefVideos();
+                } catch (e) { alert("参考视频上传失败：" + e.message); }
+                log.textContent = "可选：给 AI 垫一段参考视频，引导运镜/构图/节奏（不会出现在成片里）。豆包引擎最多 10 条，单条建议 ≤100MB。";
+                ev.target.value = "";
+            };
+            reader.onerror = () => { alert("读取视频文件失败"); ev.target.value = ""; };
+            reader.readAsDataURL(f);
+        }
+        function addRefVideoUrl() {
+            const url = (prompt("输入参考视频 URL：\n· 公网可访问的 mp4 直链（豆包云端能拉取）\n· 或本地图床地址 /static/uploads/...") || "").trim();
+            if (!url) return;
+            if (!currentData.refVideos) currentData.refVideos = [];
+            if (currentData.refVideos.length >= 10) { alert("最多垫 10 条参考视频，请先删除一条。"); return; }
+            currentData.refVideos.push({ url, name: url.split("/").pop().split("?")[0] || "外部链接" });
+            saveCurrentProject();
+            renderRefVideos();
+        }
+        function removeRefVideo(i) {
+            const items = currentData.refVideos || [];
+            const it = items[i];
+            if (!it) return;
+            if (!confirm(`移除参考视频「${it.name || it.url}」？\n（上传的本机文件会一并从服务器删除）`)) return;
+            items.splice(i, 1);
+            saveCurrentProject();
+            renderRefVideos();
+            // 本地上传的 refvideo_ 文件同步从服务器清理（外链不动）
+            const fname = String(it.url).split("/").pop().split("?")[0];
+            if (fname.startsWith("refvideo_")) {
+                fetch(`${API}/api/delete-files`, {
+                    method: "POST", headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ urls: [it.url] }),
+                }).catch(() => {});
+            }
+        }
         async function genVideo(sbId) {
             const sbItem = currentData.storyData.storyboards.find(s => s._id === sbId);
             if (!sbItem) return;
@@ -2741,7 +2846,7 @@
             const sbImages = (sbItem.images && sbItem.images.length)
                 ? sbItem.images
                 : (sbItem.imgSrc ? [{ url: sbItem.imgSrc, role: "" }] : []);
-            if (!sbImages.length && getWorkflowKind() !== "text") return alert("请先生成分镜图（或选择「📝 文生视频」工作流）");
+            if (!sbImages.length && getWorkflowKind() !== "text" && getWorkflowKind() !== "doubao") return alert("请先生成分镜图（或选择「📝 文生视频」工作流）");
 
             const mode = getVideoMode();
             const taggedFirst = sbImages.find(im => im.role === "first");
@@ -2812,6 +2917,9 @@
                 // 新模板会额外产出 video_prompt（专给图生视频的运动描述），旧项目没有该字段则回退 image_prompt
                 let prompt = sbItem.edited_prompt || sbItem.video_prompt || sbItem.image_prompt || sbItem.description;
                 let workflowId = getSelectedWorkflowId();
+                // 引擎分流：doubao: 前缀 = 豆包 Seedance（火山方舟）；其余 = AutoDL ComfyUI 工作流
+                const isDoubao = workflowId.startsWith("doubao:");
+                const doubaoModel = isDoubao ? workflowId.slice("doubao:".length) : null;
                 // 测量参考图的实际宽高比，后端据此自动选横屏/竖屏档位（H3 工作流默认出竖屏）。
                 // 第一张探测失败（加载错误/超时）时依次尝试后面的图，全失败才放弃——
                 // 探测失败会导致后端拿不到宽高比而回退竖屏默认档，横屏项目就会出竖屏视频。
@@ -2851,7 +2959,16 @@
                         duration: getVideoDuration(),
                         resolution: "768p",
                         image_aspect: imageAspect,
-                        workflow_id: workflowId
+                        workflow_id: isDoubao ? null : workflowId,
+                        video_engine: isDoubao ? "doubao" : "autodl",
+                        video_model: doubaoModel,
+                        doubao_resolution: isDoubao ? (localStorage.getItem("wb_doubao_res") || "480p") : undefined,
+                        // 垫参考视频：所有引擎都传（豆包 Seedance 作 reference_video；AutoDL 工作流不接受时后端自动去掉重试）
+                        ref_video_urls: (currentData.refVideos || []).map(v => v.url),
+                        // 页面链接里的 sharecode + 页面公网地址：后端把本地上传的垫视频拼成公网直链给云端拉取
+                        // （请求经代理转发后后端看到的 host 是内网地址，所以必须由前端显式传 origin）
+                        share_code: (new URLSearchParams(location.search).get("sharecode") || undefined),
+                        page_origin: location.origin
                     }),
                 });
                 

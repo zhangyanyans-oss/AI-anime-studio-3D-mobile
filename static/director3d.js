@@ -9,16 +9,20 @@
 import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 
-const WORLD = 10;                 // 0-1 归一化坐标 → 10x10 米的世界
+const WORLD = 10;                 // 缺省房间尺寸（米）：0-1 归一化坐标 → 10x10 米世界
 const EYE = 1.6;                  // 机位预览视点高度（米）
 const instances = new Map();      // key -> instance
 
-const toWorldX = nx => (nx - 0.5) * WORLD;
-const toWorldZ = ny => (ny - 0.5) * WORLD;
-const toNormX = wx => Math.min(1, Math.max(0, wx / WORLD + 0.5));
-const toNormZ = wz => Math.min(1, Math.max(0, wz / WORLD + 0.5));
+// 房间真实尺寸（米）：导演可在面板里调整（plot.room={w,h}），buildScene 每次按当前图纸刷新。
+// 人物胶囊身高固定约1.68米（现实比例），房间变大变小后人物在房间里的比例自动正确。
+let RW = WORLD, RD = WORLD;
+const toWorldX = nx => (nx - 0.5) * RW;
+const toWorldZ = ny => (ny - 0.5) * RD;
+const toNormX = wx => Math.min(1, Math.max(0, wx / RW + 0.5));
+const toNormZ = wz => Math.min(1, Math.max(0, wz / RD + 0.5));
 // 必须放在模块顶层：applyDrag 是模块级函数，之前 clampW 被困在 open() 里，每次拖动都抛 ReferenceError，导致坐标永远更新不了
-const clampW = v => Math.min(WORLD / 2, Math.max(-WORLD / 2, v));
+const clampW = v => Math.min(RW / 2, Math.max(-RW / 2, v));   // 横向（x）
+const clampD = v => Math.min(RD / 2, Math.max(-RD / 2, v));   // 纵向（z）
 const facingRad = deg => (deg || 0) * Math.PI / 180;          // 0=图纸上方(-z)，90=右(+x)
 const facingDir = deg => new THREE.Vector3(Math.sin(facingRad(deg)), 0, -Math.cos(facingRad(deg)));
 
@@ -74,9 +78,19 @@ function buildScene(inst) {
     dl.position.set(6, 10, 4);
     scene.add(dl);
 
-    // 地面（layer0：机位预览也可见，提供地平线）
+    inst.pickables = [];
+    inst.charGroups = [];
+    inst.pathLines = [];
+    inst.dynamic = { fans: [], edges: [], targets: [] }; // 随 facing 重建的机位部件
+    // 房间真实尺寸：从图纸读取（缺省 10×10），同步到模块级 RW/RD，全部世界坐标换算随之生效
+    try {
+        RW = Math.min(50, Math.max(2, Number(plot.room?.w) || WORLD));
+        RD = Math.min(50, Math.max(2, Number(plot.room?.h) || WORLD));
+    } catch (_) { RW = WORLD; RD = WORLD; }
+
+    // 地面（layer0：机位预览也可见，提供地平线）——按房间真实尺寸
     const ground = new THREE.Mesh(
-        new THREE.PlaneGeometry(WORLD, WORLD),
+        new THREE.PlaneGeometry(RW, RD),
         new THREE.MeshLambertMaterial({ color: "#26334d" })
     );
     ground.rotation.x = -Math.PI / 2;
@@ -84,22 +98,18 @@ function buildScene(inst) {
 
     // 网格/边框/辅助物（layer1：只在导演视角显示）
     const L1 = o => o.traverse(c => c.layers.set(1)) || o;
-    const grid = new THREE.GridHelper(WORLD, 20, "#475569", "#334155");
+    const grid = new THREE.GridHelper(Math.max(RW, RD), 20, "#475569", "#334155");
+    grid.scale.set(RW / Math.max(RW, RD), 1, RD / Math.max(RW, RD));   // 长方形房间网格也拉伸贴合
     grid.position.y = 0.01;
     scene.add(L1(grid));
     const border = new THREE.LineLoop(
         new THREE.BufferGeometry().setFromPoints([
-            new THREE.Vector3(-WORLD / 2, 0.02, -WORLD / 2), new THREE.Vector3(WORLD / 2, 0.02, -WORLD / 2),
-            new THREE.Vector3(WORLD / 2, 0.02, WORLD / 2), new THREE.Vector3(-WORLD / 2, 0.02, WORLD / 2),
+            new THREE.Vector3(-RW / 2, 0.02, -RD / 2), new THREE.Vector3(RW / 2, 0.02, -RD / 2),
+            new THREE.Vector3(RW / 2, 0.02, RD / 2), new THREE.Vector3(-RW / 2, 0.02, RD / 2),
         ]),
         new THREE.LineBasicMaterial({ color: "#64748b" })
     );
     scene.add(L1(border));
-
-    inst.pickables = [];
-    inst.charGroups = [];
-    inst.pathLines = [];
-    inst.dynamic = { fans: [], edges: [], targets: [] }; // 随 facing 重建的机位部件
 
     // ---------- 人物 ----------
     (plot.characters || []).forEach((c, ci) => {
@@ -157,26 +167,44 @@ function buildScene(inst) {
     });
 
     // ---------- 道具 ----------
+    // 门/窗用专属造型与颜色区分（导演手动新增的示意图元素与 AI 解析的陈设同一数据模型）
     (plot.props || []).forEach((p, pi) => {
         if (typeof p.x !== "number" || typeof p.y !== "number") return;
-        const w = Math.max((p.w || 0.1) * WORLD, 0.3), h = Math.max((p.h || 0.1) * WORLD, 0.3);
+        const lblTxt = String(p.label || p.name || "道具");
+        const isDoor = /门/.test(lblTxt), isWin = /窗/.test(lblTxt);
+        const w = Math.max((p.w || 0.1) * RW, 0.3), h = Math.max((p.h || 0.1) * RD, 0.3);
+        // 门=棕色立板（近真人高度），窗=蓝色半透明悬浮板（离地中段），其余=灰色方块
+        const bh = isDoor ? 1.9 : isWin ? 0.9 : 1.0;
+        const color = isDoor ? "#b45309" : isWin ? "#38bdf8" : "#7c8aa0";
         const box = new THREE.Mesh(
-            new THREE.BoxGeometry(w, 1.0, h),
-            new THREE.MeshLambertMaterial({ color: "#7c8aa0", transparent: true, opacity: 0.92 })
+            new THREE.BoxGeometry(w, bh, h),
+            new THREE.MeshLambertMaterial({ color, transparent: true, opacity: isWin ? 0.55 : 0.92 })
         );
-        box.position.set(toWorldX(p.x), 0.5, toWorldZ(p.y));
+        box.position.set(toWorldX(p.x), isWin ? 0.85 : bh / 2, toWorldZ(p.y));
         box.userData.pick = { type: "prop", idx: pi };
-        const label = textSprite(p.label || p.name || "道具", "#cbd5e1");
+        const label = textSprite(lblTxt, "#cbd5e1");
         label.layers.set(1);   // 同上：不进成片构图预览
         label.position.y = 1.5;
         const g = new THREE.Group();
         g.add(box, label);
         g.position.copy(box.position);
         box.position.set(0, 0, 0);
+        // 建筑朝向：0=图纸上方，顺时针（与人物/机位同一约定）；默认 0
+        g.rotation.y = -facingRad(p.facing);
+        // 朝向手柄：琥珀色锥，拖它转建筑/道具朝向（锥尖指道具正面 -z）
+        // v18：加大加高（半径 0.2/高 0.5），不再贴地——避免被家具自身或相邻家具挡住，手机上也更容易点中
+        const face = new THREE.Mesh(
+            new THREE.ConeGeometry(0.2, 0.5, 12),
+            new THREE.MeshLambertMaterial({ color: "#f59e0b" })
+        );
+        face.rotation.x = Math.PI / 2;
+        face.position.set(0, Math.max(0.35, bh / 2), -(Math.max(w, h) / 2 + 0.6));
+        face.userData.pick = { type: "propface", idx: pi };
+        g.add(face);
         scene.add(g);
         inst.propGroups = inst.propGroups || [];
         inst.propGroups[pi] = g;
-        inst.pickables.push(box);
+        inst.pickables.push(box, face);
     });
 
     // ---------- 机位 ----------
@@ -362,8 +390,8 @@ function open(key, container, plot, palette, onCommit, kind) {
         <div class="dir3d-wrap" style="position:relative; height:100%; border:1px solid var(--border-color); border-radius:10px; overflow:hidden; background:#0f172a;">
                 <div class="dir3d-hint" style="position:absolute; top:8px; left:10px; z-index:3; font-size:12px; color:#94a3b8; background:rgba(10,16,32,.72); padding:4px 10px; border-radius:8px; pointer-events:none;">
                     ${inst.kind === "topview"
-                        ? `🖱️ 单指拖人物/机位/道具（松手自动重绘图纸）· 双指旋转/缩放视角 · 右键平移 <b style="color:#fca5a5;">·v15</b>`
-                        : `🖱️ 单指拖人物/机位/道具/轨迹点（松手自动重绘图纸）· 双指旋转/缩放视角 · 右键平移 <b style="color:#fca5a5;">·v15</b>`}
+                        ? `🖱️ 单指拖人物/机位/道具（松手自动重绘）· 拖家具前方的<b style="color:#fbbf24;">大号琥珀锥</b>转朝向 · 操控面板可调房间尺寸/新增/改标题/📏缩放家具 · 双指旋转/缩放视角 · 右键平移 <b style="color:#fca5a5;">·v20</b>`
+                        : `🖱️ 单指拖人物/机位/道具/轨迹点（松手自动重绘）· 拖家具前方的<b style="color:#fbbf24;">大号琥珀锥</b>转朝向 · 操控面板可调房间尺寸/新增/改标题/📏缩放家具 · 双指旋转/缩放视角 · 右键平移 <b style="color:#fca5a5;">·v20</b>`}
                 </div>
             <button class="dir3d-pvbtn" title="开关右下角的机位预览窗，挡住场景时可关掉" style="position:absolute; top:8px; right:10px; z-index:4; font-size:12px; color:#e2e8f0; background:rgba(10,16,32,.72); border:1px solid rgba(148,163,184,.45); padding:4px 10px; border-radius:8px; cursor:pointer;">🎥 预览窗：开</button>
             <button class="dir3d-panelbtn" title="一键收起/展开左下角的机位操控面板，挡住场景时收起" style="position:absolute; top:44px; right:10px; z-index:4; font-size:12px; color:#e2e8f0; background:rgba(10,16,32,.72); border:1px solid rgba(148,163,184,.45); padding:4px 10px; border-radius:8px; cursor:pointer;">🎛 操控面板：开</button>
@@ -384,6 +412,16 @@ function open(key, container, plot, palette, onCommit, kind) {
                     <button data-p="45" class="hpbtn">俯45°</button>
                     <input type="range" class="pslider" min="-60" max="60" step="5" value="0" style="width:100px; accent-color:#ef4444;">
                     <span class="pval" style="font-size:11px; color:#94a3b8; min-width:80px;">水平视角</span>
+                </div>
+                <div style="display:flex; gap:6px; align-items:center; flex-wrap:wrap;">
+                    <span style="font-size:12px; color:#fca5a5;">➕ 新增元素</span>
+                    <button class="hpbtn" data-add="door">🚪 门</button>
+                    <button class="hpbtn" data-add="window">🪟 窗</button>
+                    <button class="hpbtn" data-add="custom">📦 自定义</button>
+                    <button class="hpbtn" data-room>🏠 房间尺寸</button>
+                    <button class="hpbtn" data-mode="rename">✏️ 改标题</button>
+                    <button class="hpbtn" data-mode="scale">📏 缩放</button>
+                    <button class="hpbtn" data-mode="del">🗑 删元素</button>
                 </div>
                 <div style="display:flex; gap:6px; align-items:center; flex-wrap:wrap;">
                     <span style="font-size:12px; color:#fca5a5;">🎥 机位朝向</span>
@@ -510,6 +548,66 @@ function open(key, container, plot, palette, onCommit, kind) {
         setCamFacing(camInit.facing || 0, false);
     }
 
+    // ---------- 新增元素（门/窗/自定义）与改标题/删元素模式 ----------
+    // 新增的门窗示意图走道具（props）同一数据模型：3D 与 2D 图纸、提示词翻译全链路通用。
+    // 后端 _normalize_plot 限制 props 最多 12 个、label 最多 8 字。
+    const ADD_PRESET = {
+        door:   { label: "门", w: 0.09, h: 0.05 },
+        window: { label: "窗", w: 0.12, h: 0.04 },
+    };
+    const rebuildLocal = () => {
+        // 本地立即重建 3D 场景（不等服务器重绘往返）：open 里 sig 相同会跳过，清空强制重建
+        inst.sig = "";
+        open(inst.key, inst.container, inst.plot, inst.palette, inst.onCommit, inst.kind);
+    };
+    wrap.querySelectorAll(".hpbtn[data-add]").forEach(b => b.addEventListener("click", () => {
+        const props = inst.plot.props = inst.plot.props || [];
+        if (props.length >= 12) { alert("陈设元素最多 12 个，请先删掉一些再新增"); return; }
+        const type = b.dataset.add;
+        let label, w, h;
+        if (type === "custom") {
+            const inp = prompt("新元素的名称（如：桌子、柜子、屏风）：", "");
+            if (!inp || !inp.trim()) return;
+            label = inp.trim().slice(0, 8);
+            w = 0.12; h = 0.08;
+        } else {
+            ({ label, w, h } = ADD_PRESET[type] || {});
+            if (!label) return;
+        }
+        // 摆在场地中心附近、按已有数量错开，避免新元素全部叠在原点
+        const n = props.length;
+        const p = {
+            label, shape: "rect",
+            x: Math.min(0.92, Math.max(0.08, 0.5 + ((n % 5) - 2) * 0.12)),
+            y: Math.min(0.92, Math.max(0.08, 0.5 + (Math.floor(n / 5) - 1) * 0.12)),
+            w, h, facing: 0,
+        };
+        props.push(p);
+        // 立即提交：后端按新 plot 重绘 2D 图纸并持久化坐标
+        inst.onCommit && inst.onCommit(JSON.parse(JSON.stringify(inst.plot)));
+        rebuildLocal();
+    }));
+    // 模式按钮：激活后点元素即改名/删除（不进入拖拽）；再点一次取消
+    // 房间尺寸调整：prompt 宽×深（米），写入 plot.room 后整场重建——
+    // 人物胶囊身高固定约1.68米，房间变大变小后人物在房间里的比例自动符合现实
+    wrap.querySelector(".hpbtn[data-room]").addEventListener("click", () => {
+        const cur = inst.plot.room && inst.plot.room.w ? `${inst.plot.room.w}×${inst.plot.room.h}` : "10×10";
+        const inp = prompt(`房间真实尺寸（米），格式：宽×深，如 12×8\n当前：${cur}\n人物身高按现实约1.7米，房间越小人物越显大`, cur);
+        if (!inp) return;
+        const m = inp.match(/(\d+(?:\.\d+)?)\s*[×x*\*]\s*(\d+(?:\.\d+)?)/);
+        if (!m) { alert("格式不对，请输入如：12×8"); return; }
+        const w = Math.min(50, Math.max(2, parseFloat(m[1])));
+        const h = Math.min(50, Math.max(2, parseFloat(m[2])));
+        inst.plot.room = { w, h };
+        inst.onCommit && inst.onCommit(JSON.parse(JSON.stringify(inst.plot)));
+        rebuildLocal();
+        toast(`房间已设为约 ${w} 米 × ${h} 米`);
+    });
+    wrap.querySelectorAll(".hpbtn[data-mode]").forEach(b => b.addEventListener("click", () => {
+        inst.uiMode = inst.uiMode === b.dataset.mode ? null : b.dataset.mode;
+        wrap.querySelectorAll(".hpbtn[data-mode]").forEach(x => x.classList.toggle("active", x.dataset.mode === inst.uiMode));
+    }));
+
     const renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true });
     renderer.setPixelRatio(Math.min(devicePixelRatio || 1, 2));
     renderer.autoClear = false;
@@ -610,6 +708,41 @@ function open(key, container, plot, palette, onCommit, kind) {
         if (!hits.length) return;
         const hitObj = hits[0].object;
         const pk = hitObj.userData.pick;
+        // 改标题/删元素模式：点道具即改名/删除，不进入拖拽
+        if (inst.uiMode && (pk.type === "prop" || pk.type === "propface")) {
+            const p = (inst.plot.props || [])[pk.idx];
+            drag = null;
+            controls.enabled = true;
+            if (p && inst.uiMode === "rename") {
+                const inp = prompt("修改元素标题：", p.label || "");
+                if (inp && inp.trim()) {
+                    p.label = inp.trim().slice(0, 8);
+                    inst.onCommit && inst.onCommit(JSON.parse(JSON.stringify(inst.plot)));
+                    rebuildLocal();
+                }
+            } else if (p && inst.uiMode === "scale") {
+                // 缩放家具：按百分比缩放占地尺寸（w/h 同乘）。0-1 归一化 = 10x10 米世界，
+                // 占地米数直接给导演看，缩放后空间比例随 plot 持久化并进生图提示词
+                const wm = ((p.w || 0.1) * RW).toFixed(1), hm = ((p.h || 0.1) * RD).toFixed(1);
+                const inp = prompt(`「${p.label || ""}」当前占地约 ${wm}m × ${hm}m\n输入缩放百分比（100=不变，150=放大到1.5倍，50=缩小一半）：`, "100");
+                const pct = parseFloat(inp);
+                if (pct > 0 && pct !== 100) {
+                    const f = Math.min(5, Math.max(0.2, pct / 100));
+                    p.w = Math.min(0.95, Math.max(0.02, (p.w || 0.1) * f));
+                    p.h = Math.min(0.95, Math.max(0.02, (p.h || 0.1) * f));
+                    inst.onCommit && inst.onCommit(JSON.parse(JSON.stringify(inst.plot)));
+                    rebuildLocal();
+                    toast(`「${p.label || ""}」已缩放至约 ${(p.w * RW).toFixed(1)}m × ${(p.h * RD).toFixed(1)}m`);
+                }
+            } else if (p && inst.uiMode === "del") {
+                if (confirm(`删除元素「${p.label || ""}」？`)) {
+                    inst.plot.props.splice(pk.idx, 1);
+                    inst.onCommit && inst.onCommit(JSON.parse(JSON.stringify(inst.plot)));
+                    rebuildLocal();
+                }
+            }
+            return;
+        }
         const gp = groundPoint(e) || hits[0].point;
         drag = { pk, moved: false, start: { x: e.clientX, y: e.clientY } };
         // 拖拽偏移：抓住物体的点到其地面锚点的差，避免拖动瞬跳
@@ -830,7 +963,7 @@ function pickAnchor(inst, pk) {
         const g = inst.charGroups[pk.idx];
         return c && g ? { x: g.position.x, z: g.position.z } : null;
     }
-    if (pk.type === "prop") {
+    if (pk.type === "prop" || pk.type === "propface") {
         const g = (inst.propGroups || [])[pk.idx];
         return g ? { x: g.position.x, z: g.position.z } : null;
     }
@@ -843,7 +976,7 @@ function pickAnchor(inst, pk) {
 
 // 把地面拾取点应用到 plot 副本与 3D 物体（拖拽中的实时反馈）
 function applyDrag(inst, pk, gp, off) {
-    const wx = clampW(gp.x - off.x), wz = clampW(gp.z - off.z);
+    const wx = clampW(gp.x - off.x), wz = clampD(gp.z - off.z);
     const nx = toNormX(wx), ny = toNormZ(wz);
 
     if (pk.type === "char") {
@@ -885,6 +1018,15 @@ function applyDrag(inst, pk, gp, off) {
         const g = (inst.propGroups || [])[pk.idx]; if (!g) return;
         p.x = nx; p.y = ny;
         g.position.set(wx, 0.5, wz);
+    } else if (pk.type === "propface") {
+        // 拖朝向手柄：以道具中心为圆心，指向转朝向（与人物 charface 同一套公式）
+        const p = (inst.plot.props || [])[pk.idx]; if (!p) return;
+        const g = (inst.propGroups || [])[pk.idx]; if (!g) return;
+        const dx = wx - g.position.x, dz = wz - g.position.z;
+        if (Math.hypot(dx, dz) < 0.05) return;
+        const deg = Math.round(((Math.atan2(dx, -dz) * 180 / Math.PI % 360) + 360) % 360);
+        p.facing = deg;
+        g.rotation.y = -facingRad(deg);
     } else if (pk.type === "camera") {
         const cam = inst.plot.camera; if (!cam) return;
         const dx = nx - cam.x, dy = ny - cam.y;
@@ -923,10 +1065,42 @@ function applyDrag(inst, pk, gp, off) {
     }
 }
 
+// ---------- 导出机位预览帧（成片构图） ----------
+// 生图用：把预览窗所见（从机位按 facing/pitch/fov 实时渲染的构图）作为"构图基准图"传进生图参考池，
+// 用户要求：最后出图以预览窗所见即所得为准。临时把渲染器改成 1280×720 渲染一帧 pvCam，
+// 导出后立即恢复原尺寸（preserveDrawingBuffer 已开，toDataURL 随时可取）。
+function exportPreview(key) {
+    const inst = instances.get(key);
+    if (!inst || !inst.renderer || !inst.pvCam || !inst.scene) return "";
+    const cam = inst.plot.camera;
+    if (!cam || typeof cam.x !== "number") return "";
+    const r = inst.renderer;
+    const w = inst.viewW || 1, h = inst.viewH || 1;
+    const dpr = r.getPixelRatio();
+    const W = 960, H = 540;    // 与 pvCam 固定 16:9 一致；960 宽足够当构图参考，dataURL 落库不膨胀
+    try {
+        r.setPixelRatio(1);
+        r.setSize(W, H, false);
+        r.setScissorTest(false);
+        r.setViewport(0, 0, W, H);
+        r.clear(true, true, false);
+        r.render(inst.scene, inst.pvCam);
+        return r.domElement.toDataURL("image/jpeg", 0.82);
+    } catch (e) {
+        console.warn("[director3d] 导出预览帧失败", e);
+        return "";
+    } finally {
+        r.setPixelRatio(dpr);
+        r.setSize(w, h, false);
+        r.setViewport(0, 0, w, h);
+    }
+}
+
 // ---------- 对外 API ----------
 window.Director3D = {
     open, dispose,
     isOpen: key => instances.has(key),
     closeAll,
+    exportPreview,
 };
 window.dispatchEvent(new Event("director3d-ready"));
