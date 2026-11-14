@@ -2458,7 +2458,7 @@ function resolveAssetRefs(b, onlyVid) {
     if (!named) continue;
     seen.add(sc.image_url);
     out.push({ url: sc.image_url, meta: { kind: "scene", name: sc.name,
-      description: `视频提示词提到的场景「${sc.name}」设定图：环境、陈设、空间结构与光线氛围以此图为基准；人物动作、人数与画面构图仍以提示词和分镜图为准，不得把本图里的人物画进画面${sc.image_prompt ? "。" + sc.image_prompt : ""}` } });
+      description: `视频提示词提到的场景「${sc.name}」设定图：陈设的种类、样式、空间结构与光线氛围以此图为基准（左墙的柜子仍在左墙），但此图是在固定机位画的样板照、**不锁定拍摄视角**——画面视角仍按本镜机位与首帧构图执行，须把房间想象成从机位方向看出去的透视图；人物动作、人数与画面构图仍以提示词和分镜图为准，不得把本图里的人物画进画面${sc.image_prompt ? "。" + sc.image_prompt : ""}` } });
   }
   return out;
 }
@@ -2508,6 +2508,7 @@ async function genBoardImage(bid) {
     urls.push(b.previewShot);
     meta.push({ kind: "shot_preview", name: "机位预览", description:
       "导演 3D 导演台的机位预览（从镜头位置实时渲染的本镜构图）：最终画面的人物站位、画面左右、远近大小层次、身体朝向、谁被谁遮挡、机位高度与视角必须与此图一致——此图就是成片应该达到的构图。"
+      + "【视角权威】房间的透视取景也以此图为准：墙面朝向与倾斜、消失点方向、地板与天花板的透视变形、门窗户在画面中的方位，都按本图的机位视角画；场景设定图给的是另一个方向看房间的样板照，其拍摄视角严禁照搬，须把房间『旋转』到本图机位方向重新取景。"
       + "但此图中的彩色胶囊、方块、锥体只是站位示意模型：人物的真实长相、发型、服装一律按角色设定图与提示词执行，家具门窗的真实样式按场景设定图与提示词执行；"
       + "严禁把胶囊人偶、几何方块、琥珀色锥体等示意元素画进画面；画风、光线、色调按画风设定与提示词执行，不参照本图的示意渲染风格。" });
   }
@@ -2607,7 +2608,7 @@ async function genBoardImage(bid) {
       for (const sc of st.scenes || [])
         if (parts.some((p) => nameHit(p, sc.name))) {
           const brief = furnitureBrief(sc.furniture);
-          const desc = `提示词中以中括号引用的场景「${sc.name}」官方设定图（环境、陈设必须与此图一致）${sc.image_prompt || sc.description || ""}${brief}`;
+          const desc = `提示词中以中括号引用的场景「${sc.name}」官方设定图。注意：此图只锁定陈设的种类、样式、材质、色调与相对方位（左墙的柜子还在左墙），**不锁定拍摄视角**——设定图是站在一个固定机位画的，本镜机位很可能在另一个方向，画面必须按本镜机位重新取景：想象自己走到调度图机位的位置环视这个房间，把看到的透视图画出来（近大远小、墙面倾斜与消失点、地板天花板透视变形都按机位视角算），陈设样式照抄本图即可${sc.image_prompt || sc.description || ""}${brief}`;
           if (pushRef(sc, "scene", "场景", "", desc)) hitNames.add(sc.name);
         }
       for (const p2 of st.props || [])
@@ -2684,7 +2685,8 @@ async function genBoardImage(bid) {
   for (const sc of sceneMatched) if (!addedImgs.has(sc.image_url)) {
     urls.push(sc.image_url);
     meta.push({ kind: "scene", name: sc.name,
-      description: (sc.image_prompt || sc.description || "") + furnitureBrief(sc.furniture) });
+      description: "场景「" + sc.name + "」设定图：只锁陈设样式、材质与相对方位，不锁定拍摄视角——画面按本镜机位重新取景（想象绕到机位方向环视房间画透视图）。"
+        + (sc.image_prompt || sc.description || "") + furnitureBrief(sc.furniture) });
   }
   // 入画人物硬约束：提示词里点了名，就把名单钉死在 prompt 里（参考图已按名单过滤，这里再加一道文字闸）。
   // ⚠️ 闸的是「正文没写的无名人影」，不是正文明确要求的群演——2026-11-14 实测教训：
