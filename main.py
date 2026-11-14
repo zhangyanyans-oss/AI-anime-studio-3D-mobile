@@ -1571,9 +1571,54 @@ def _normalize_plot(plot: dict) -> dict:
 _DIAGRAM_PALETTE = ["#e6194b", "#3cb44b", "#4363d8", "#f58231", "#911eb4",
                     "#008080", "#f032e6", "#9a6324", "#000075", "#800000"]
 
-def _frame_side_text(cross: float, dist: float, fov: float) -> str:
+def _half_h_fov(cam: dict, aspect: float = 16 / 9) -> float:
+    """机位横向半视野角（度）。fov 与 3D 导演台预览（three.js PerspectiveCamera）同一口径
+    ＝竖直视场角；横向半视野按画面宽高比换算：tan(hfov/2)=tan(fov/2)×aspect。
+    实测教训（2026-11-14 镜2 崩坏）：此前把 fov 直接当水平半视野用（55→27.5°），
+    而预览帧 16:9 的横向半视野实际是 42.8°——坐标翻译说"发小贴边可能被裁切"，
+    预览帧里他却好好在画面右缘远处，两份权威互相矛盾，模型崩成贴脸大特写。"""
+    import math
+    fov = float(cam.get("fov") or 55)
+    return math.degrees(math.atan(math.tan(math.radians(fov / 2)) * max(0.3, min(3.0, aspect))))
+
+
+def _aspect_from_size(size) -> float:
+    """生图尺寸字符串（1920x1080）→ 宽/高比（fov 横向换算用）。解析失败兜底 16:9。"""
+    try:
+        w, h = str(size or "").lower().replace("×", "x").split("x")
+        w, h = int(w), int(h)
+        if w > 0 and h > 0:
+            return w / h
+    except Exception:
+        pass
+    return 16 / 9
+
+
+def _size_note(depth_m: float, fov_v: float) -> str:
+    """距镜头 depth 米、身高约1.65米的人，全身在画面中的高度占比 → 直观锚点。
+    中景人物崩成贴脸大特写的主要原因是模型对"距镜头6米"没有画面概念，给占比锚点。"""
+    import math
+    try:
+        vis_h = 2.0 * max(0.6, depth_m) * math.tan(math.radians(fov_v / 2))
+        r = 1.65 / vis_h
+    except Exception:
+        return ""
+    if r >= 1.2:
+        return "全身超出画面高度（只露局部，严禁画成完整大脸特写）"
+    if r >= 0.7:
+        return "全身约占画面高度七成（胸像以上景别）"
+    if r >= 0.45:
+        return "全身约占画面高度一半（半身像）"
+    if r >= 0.25:
+        return "全身约占画面高度三分之一（膝上到全身景别）"
+    if r >= 0.12:
+        return "全身约占画面高度五分之一（完整全身、明显不大）"
+    return "全身很小（远小近大透视的远景人物）"
+
+
+def _frame_side_text(cross: float, dist: float, half_h: float) -> str:
     """把机位相对的左右偏角换成生图模型能落地的画面落位描述。
-    cross/dist ＝ 人物相对视轴的带符号正弦（>0 视轴右侧）。
+    cross/dist ＝ 人物相对视轴的带符号正弦（>0 视轴右侧）。half_h＝横向半视野角（度）。
     近轴（几乎正对镜头）时必须说'画面中部'——若硬说'画面左/右'，
     模型会把几度的微小偏差放大成明显靠边，构图直接跑偏。"""
     import math
@@ -1586,7 +1631,7 @@ def _frame_side_text(cross: float, dist: float, fov: float) -> str:
     # 细分两档：偏中 / 靠边——只说"画面左侧"时，模型常把 20° 偏移和 5° 偏移画成同一位置
     if abs(lat_deg) < 20:
         return f"画面{side}偏中（约偏离画面中线四分之一画幅，与画面中心之间留有空隙）"
-    edge = "、贴近画面边缘可能被裁切" if abs(lat_deg) > max(fov / 2, 30) else "、靠画面边一带"
+    edge = "、贴近画面边缘可能被裁切" if abs(lat_deg) > max(half_h, 30) else "、靠画面边一带"
     return f"画面{side}{edge}"
 
 
@@ -1664,7 +1709,7 @@ def _camera_pitch_rule(p) -> str:
             "背景以天空或天花板为主，地面基本不可见，严禁出现俯视或平视构图。")
 
 
-def _facing_scene_anchor(plot: dict, px: float, py: float, pf: float, self_name: str, cam: dict) -> str:
+def _facing_scene_anchor(plot: dict, px: float, py: float, pf: float, self_name: str, cam: dict, aspect: float = 16 / 9) -> str:
     """人物朝向的【场景内锚点】：他面朝方向锥内（陈设±55°/人物±45°）最近的门/家具/其他人物。
     实测教训：朝向只写镜头相对描述（"正面对镜头"）时，生图模型的"人要正脸朝观众"先验
     会压过文字——给画面里的具体目标（面朝「门」/面朝「发小」）比抽象角度服从度高得多。
@@ -1675,7 +1720,7 @@ def _facing_scene_anchor(plot: dict, px: float, py: float, pf: float, self_name:
     cx, cy = float(cam.get("x", 0.5)), float(cam.get("y", 0.95))
     crad = math.radians(float(cam.get("facing") or 0) % 360)
     cfx, cfy = math.sin(crad), -math.cos(crad)
-    fov = float(cam.get("fov") or 55)
+    _half = _half_h_fov(cam, aspect)
 
     def in_view(tx: float, ty: float) -> bool:
         vx, vy = tx - cx, ty - cy
@@ -1685,7 +1730,7 @@ def _facing_scene_anchor(plot: dict, px: float, py: float, pf: float, self_name:
         dep = vx * cfx + vy * cfy
         if dep <= 0:
             return False
-        return math.degrees(math.acos(max(-1.0, min(1.0, dep / vd)))) <= fov / 2 + 25
+        return math.degrees(math.acos(max(-1.0, min(1.0, dep / vd)))) <= _half + 25
 
     best = None  # (角度, 是否陈设, 标签, 是否在视野内)
     for p in (plot.get("props") or []):
@@ -1730,10 +1775,11 @@ def _facing_scene_anchor(plot: dict, px: float, py: float, pf: float, self_name:
     return f"面朝「{label}」（正对着他/她）" + ("" if iv else "（该目标在本画面之外）")
 
 
-def compute_camera_facts(plot: dict) -> dict:
+def compute_camera_facts(plot: dict, aspect: float = 16 / 9) -> dict:
     """【唯一几何真相源】把调度图坐标一次性算成机位视野的结构化事实。
     机位视野摘要、坐标翻译、AI 镜头翻译全部从这里取数——只算一次、口径只有一套，
     杜绝多处各算一套、补丁打不穷尽的问题。
+    aspect＝成片画幅宽/高比（16:9→1.778、9:16→0.5625），横向视野与预览帧渲染同一口径。
     关键口径：透视成像大小 ∝ 1/沿视线投影深度 depth = vx*fx + vy*fy（不除以距离——
     除以距离就退化成视线夹角余弦，站在机位正前方的人无论多远都会被误判成"最近/最大"）。"""
     import math
@@ -1741,6 +1787,10 @@ def compute_camera_facts(plot: dict) -> dict:
     cx, cy = float(cam.get("x", 0.5)), float(cam.get("y", 0.95))
     facing = float(cam.get("facing") or 0) % 360
     fov = float(cam.get("fov") or 55)
+    half_h = _half_h_fov(cam, aspect)
+    # 房间米制尺度（归一化深度 → 真实米数）：取房间宽高平均，缺省 10 米
+    _rw, _rh = _room_dims(plot)
+    room_scale = max(1.0, (float(_rw) + float(_rh)) / 2.0)
     rad = math.radians(facing)
     fx, fy = math.sin(rad), -math.cos(rad)
     dir_desc = {0: "图纸上方", 45: "图纸右上方", 90: "图纸右方", 135: "图纸右下方",
@@ -1758,7 +1808,7 @@ def compute_camera_facts(plot: dict) -> dict:
         pf = float(c.get("facing") or 0) % 360
         facing_desc = _facing_relative_to_camera(pf, vx, vy, dist, rad)
         # 场景内朝向锚点：面朝「门」/面朝「某人」优先于镜头相对朝向（压模型的"正脸朝观众"先验）
-        _fa = _facing_scene_anchor(plot, px, py, pf, name, cam)
+        _fa = _facing_scene_anchor(plot, px, py, pf, name, cam, aspect)
         if _fa:
             try:
                 _tgt = _fa.split("「")[1].split("」")[0]
@@ -1775,7 +1825,7 @@ def compute_camera_facts(plot: dict) -> dict:
         dot_norm = depth / dist            # 视线夹角余弦（仅用于算视偏角，不当远近用）
         angle = math.degrees(math.acos(max(-1.0, min(1.0, dot_norm))))
         cross = fx * vy - fy * vx
-        side = _frame_side_text(cross, dist, fov)
+        side = _frame_side_text(cross, dist, half_h)
         plan_dir = dir_desc[min(((abs(pf - k), k) for k in dir_desc))[1]].replace("图纸", "面朝图纸")
         if dist <= 0.15:
             hidden.append({"name": name, "reason": f"紧贴机位（就在镜头旁边，不入画）",
@@ -1783,13 +1833,14 @@ def compute_camera_facts(plot: dict) -> dict:
         elif depth <= 0:
             hidden.append({"name": name, "reason": "在机位身后（镜头后方，不入画）",
                            "facing_desc": facing_desc, "side": side, "plan_dir": plan_dir, "angle": angle})
-        elif angle > fov / 2 + 25:
+        elif angle > half_h + 25:
             hidden.append({"name": name, "reason": "在机位视野范围之外（不入画）",
                            "facing_desc": facing_desc, "side": side, "plan_dir": plan_dir, "angle": angle})
         else:
-            visible.append({"name": name, "dist": dist, "depth": depth, "angle": angle, "side": side,
+            visible.append({"name": name, "dist": dist, "depth": depth, "depth_m": depth * room_scale,
+                            "angle": angle, "side": side,
                             "facing_desc": facing_desc, "plan_dir": plan_dir,
-                            "near_edge": angle > fov / 2 + 10})
+                            "near_edge": angle > half_h + 10})
     # 升序：投影深度最小（离镜头最近、画面里最大）在前
     visible.sort(key=lambda c: c["depth"])
     d0 = visible[0]["depth"] if visible else 0.0
@@ -1807,14 +1858,14 @@ def compute_camera_facts(plot: dict) -> dict:
             "visible": visible, "hidden": hidden}
 
 
-def _camera_view_summary(plot: dict) -> str:
+def _camera_view_summary(plot: dict, aspect: float = 16 / 9) -> str:
     """按坐标几何计算机位视野：谁在镜头前方（入画，近→远）、谁在机位旁/镜头后方（绝不入画）。
     这是权威事实，直接注入分镜生图约束，杜绝"从主角位置拍过去"的反向理解。
     全部几何结论取自唯一真相源 compute_camera_facts。"""
-    facts = compute_camera_facts(plot)
+    facts = compute_camera_facts(plot, aspect)
     cam = facts["camera"]
     visible, hidden = facts["visible"], facts["hidden"]
-    lines = [f"镜头架在「机位」符号处、朝{cam['dir_name']}方向拍摄（视锥约{int(cam['fov'])}°）——画面就是从机位望出去的景象。"]
+    lines = [f"镜头架在「机位」符号处、朝{cam['dir_name']}方向拍摄（竖直视锥约{int(cam['fov'])}°）——画面就是从机位望出去的景象。"]
     if cam.get("height_rule"):
         lines.append(cam["height_rule"])
     if cam.get("pitch_rule"):
@@ -1828,7 +1879,9 @@ def _camera_view_summary(plot: dict) -> str:
             depth = "离镜头最近" if i == 0 else ("离镜头最远" if i == n else f"离镜头第{i+1}近")
             vert = "位于画面下缘" if i == 0 else ("靠近画面上缘地平线" if i == n else "位于画面纵深中部")
             edge = "，靠近视野边缘可能被裁切" if c["near_edge"] else ""
-            seg.append(f"{c['name']}（{vert}、{depth}、{size_txt}、{c['side']}、{c['facing_desc']}{edge}）")
+            _sz = _size_note(c.get("depth_m", 0.0), cam["fov"])
+            _dm = f"距镜头约{c.get('depth_m', 0):.1f}米、{_sz}" if c.get("depth_m") else _sz
+            seg.append(f"{c['name']}（{vert}、{depth}、{_dm}、{size_txt}、{c['side']}、{c['facing_desc']}{edge}）")
         lines.append("机位前方视野内、会出现在画面中（从近到远）：" + "、".join(seg) + "。"
                      + "此高度比例由程序按沿视线方向的真实深度透视换算：百分比相同的人在画面中一样高，相差≥20%时高矮差异必须明显可辨。"
                      + "【年龄身高锁定】近大远小只影响画面占比，绝不改变角色自身的年龄与身高设定——"
@@ -1984,7 +2037,7 @@ def _facing_brief(desc: str) -> str:
     return desc[:i] if i > 0 else desc
 
 
-def _hidden_props_note(plot: dict) -> str:
+def _hidden_props_note(plot: dict, aspect: float = 16 / 9) -> str:
     """机位视野外的门窗/家具黑名单 → 参考图取舍说明。
     实测教训：场景设定图的参考说明写着"环境、陈设必须与此图一致"，图片的说服力压过
     提示词文字——调度图里明明把门摆在机位身后（视野外），模型仍从场景设定图把门抄进
@@ -1996,7 +2049,7 @@ def _hidden_props_note(plot: dict) -> str:
     cx, cy = float(cam.get("x", 0.5)), float(cam.get("y", 0.95))
     rad = math.radians(float(cam.get("facing") or 0) % 360)
     fx, fy = math.sin(rad), -math.cos(rad)
-    fov = float(cam.get("fov") or 55)
+    _half = _half_h_fov(cam, aspect)
     hidden = []
     for p in (plot.get("props") or []):
         label = str(p.get("label") or p.get("name") or "").strip()
@@ -2012,7 +2065,7 @@ def _hidden_props_note(plot: dict) -> str:
             angle = math.degrees(math.acos(max(-1.0, min(1.0, depth / dist))))
         except ValueError:
             angle = 180.0
-        if depth <= 0 or dist <= 0.15 or angle > fov / 2 + 25:
+        if depth <= 0 or dist <= 0.15 or angle > _half + 25:
             hidden.append(label)
     if not hidden:
         return ""
@@ -2022,7 +2075,7 @@ def _hidden_props_note(plot: dict) -> str:
               "两者冲突时以调度图纸为准。")
 
 
-def _prop_frame_lines(plot: dict) -> str:
+def _prop_frame_lines(plot: dict, aspect: float = 16 / 9) -> str:
     """把门窗/家具陈设按机位几何翻译成"画面落位"（借鉴 compute_camera_facts 的人物口径）：
     画面左右按「站在机位处朝拍摄方向看」换算（机位视线左侧＝画面左侧，与图纸方位无关），
     按沿视线投影深度排远近，视野外/机位身后的陈设明确标不入画。
@@ -2034,7 +2087,7 @@ def _prop_frame_lines(plot: dict) -> str:
         return ""
     cx, cy = float(cam.get("x", 0.5)), float(cam.get("y", 0.95))
     facing = float(cam.get("facing") or 0) % 360
-    fov = float(cam.get("fov") or 55)
+    _half = _half_h_fov(cam, aspect)
     rad = math.radians(facing)
     fx, fy = math.sin(rad), -math.cos(rad)
     items = []
@@ -2055,11 +2108,11 @@ def _prop_frame_lines(plot: dict) -> str:
             items.append((depth, f"「{label}」在机位身后（不出现在画面中）"))
         elif dist <= 0.15:
             items.append((depth, f"「{label}」紧贴机位（就在镜头旁边，基本不入画）"))
-        elif angle > fov / 2 + 25:
+        elif angle > _half + 25:
             items.append((depth, f"「{label}」在机位视野范围之外（不出现在画面中）"))
         else:
-            side = _frame_side_text(cross, dist, fov)
-            edge = "、靠近视野边缘可能被画面裁切" if angle > fov / 2 + 10 else ""
+            side = _frame_side_text(cross, dist, _half)
+            edge = "、靠近视野边缘可能被画面裁切" if angle > _half + 10 else ""
             items.append((depth, f"「{label}」在画面中的{side}{edge}"))
     if not items:
         return ""
@@ -2078,7 +2131,7 @@ def _prop_frame_lines(plot: dict) -> str:
             + "；".join(out) + "。")
 
 
-def _char_prop_relations(plot: dict, facts: dict) -> str:
+def _char_prop_relations(plot: dict, facts: dict, aspect: float = 16 / 9) -> str:
     """人物与视野内大件陈设（织布机/门/衣柜等）的前后关系，逐人说破。
     实测教训："木兰在织布机前面"这类空间关系靠模型从各自独立的落位描述里自己推，
     十有八九漂移（人画到陈设后面/穿模）。直接把谁在谁的靠镜头一侧写成权威事实。"""
@@ -2089,7 +2142,7 @@ def _char_prop_relations(plot: dict, facts: dict) -> str:
     cx, cy = float(cam.get("x", 0.5)), float(cam.get("y", 0.95))
     rad = math.radians(float(cam.get("facing") or 0) % 360)
     fx, fy = math.sin(rad), -math.cos(rad)
-    fov = float(cam.get("fov") or 55)
+    _half = _half_h_fov(cam, aspect)
     # 视野内陈设的投影深度（与 _prop_frame_lines 同一套口径）
     props_vis = []
     for p in (plot.get("props") or []):
@@ -2105,7 +2158,7 @@ def _char_prop_relations(plot: dict, facts: dict) -> str:
             angle = math.degrees(math.acos(max(-1.0, min(1.0, depth / dist))))
         except ValueError:
             continue
-        if depth > 0 and angle <= fov / 2 + 25:
+        if depth > 0 and angle <= _half + 25:
             props_vis.append((label, depth))
     if not props_vis:
         return ""
@@ -2128,7 +2181,7 @@ def _char_prop_relations(plot: dict, facts: dict) -> str:
             "严禁把人物画到陈设后面去。")
 
 
-def _spatial_lock_lines(plot: dict, facts: dict) -> str:
+def _spatial_lock_lines(plot: dict, facts: dict, aspect: float = 16 / 9) -> str:
     """空间大小比例关系全量锁定（米制）。图纸 0-1 归一化坐标按房间真实尺寸（plot.room，
     缺省 10×10 米）换算（与 3D 导演台同一换算）。人物间距、人物与陈设距离、
     人物离墙距离、陈设占地尺寸全部换算成米写进提示词——这些比例是权威事实，
@@ -2140,7 +2193,7 @@ def _spatial_lock_lines(plot: dict, facts: dict) -> str:
         return ""
     rad = math.radians(float(cam.get("facing") or 0) % 360)
     fx, fy = math.sin(rad), -math.cos(rad)
-    fov = float(cam.get("fov") or 55)
+    _half = _half_h_fov(cam, aspect)
     cx, cy = float(cam.get("x", 0.5)), float(cam.get("y", 0.95))
 
     def _in_view(px, py):
@@ -2153,7 +2206,7 @@ def _spatial_lock_lines(plot: dict, facts: dict) -> str:
             angle = math.degrees(math.acos(max(-1.0, min(1.0, depth / dist))))
         except ValueError:
             return False
-        return depth > 0 and angle <= fov / 2 + 25
+        return depth > 0 and angle <= _half + 25
 
     chars = [c for c in facts["visible"]]
     props_vis = [(str(p.get("label") or p.get("name") or "").strip(), float(p["x"]), float(p["y"]),
@@ -2201,7 +2254,7 @@ def _spatial_lock_lines(plot: dict, facts: dict) -> str:
             "不得压缩或夸大空间，不得为了让人物显眼而改变真实比例关系。")
 
 
-def format_plot_to_prompt(plot: dict, dynamic: bool = False) -> str:
+def format_plot_to_prompt(plot: dict, dynamic: bool = False, aspect: float = 16 / 9) -> str:
     """把调度图精准坐标数据翻译成生图/生视频模型听得懂的自然语言（注入 prompt 尾部）。
     生图模型读不懂白底俯视图上的圆点与扇形，但读得懂"谁离镜头最近、在画面哪一侧"。
     dynamic=False（分镜图）：名单描述初始帧＝全部画面，视野外角色绝对禁足；
@@ -2212,7 +2265,7 @@ def format_plot_to_prompt(plot: dict, dynamic: bool = False) -> str:
     import math
     if not isinstance(plot, dict):
         return ""
-    facts = compute_camera_facts(plot)
+    facts = compute_camera_facts(plot, aspect)
     chars = [c for c in (plot.get("characters") or []) if str(c.get("name") or "").strip()]
     if not chars and not plot.get("camera"):
         return ""
@@ -2236,15 +2289,15 @@ def format_plot_to_prompt(plot: dict, dynamic: bool = False) -> str:
     if prop_dirs:
         lines.append("【陈设朝向】" + "；".join(prop_dirs) + "（方位＝俯视图纸上的方位，不是画面左右）。")
     # 陈设落位：门窗/家具在画面中的左右与远近按机位几何换算（与人物同一套口径）
-    _pf = _prop_frame_lines(plot)
+    _pf = _prop_frame_lines(plot, aspect)
     if _pf:
         lines.append(_pf)
     # 人物与陈设前后关系："木兰在织布机前面"直接说破，不靠模型自己推（实测必漂）
-    _rel = _char_prop_relations(plot, facts)
+    _rel = _char_prop_relations(plot, facts, aspect)
     if _rel:
         lines.append(_rel)
     # 空间比例锁定：人物间距/离陈设/离墙/陈设占地全部换算成米，禁止模型自行压缩或夸大空间
-    _sp = _spatial_lock_lines(plot, facts)
+    _sp = _spatial_lock_lines(plot, facts, aspect)
     if _sp:
         lines.append(_sp)
 
@@ -2257,7 +2310,9 @@ def format_plot_to_prompt(plot: dict, dynamic: bool = False) -> str:
         depth_label = "离镜头最近" if i == 0 else ("离镜头最远" if i == n else f"离镜头第{i+1}近")
         vert = "位于画面下缘" if i == 0 else ("靠近画面上缘地平线" if i == n else "位于画面纵深中部")
         edge = "、靠近视野边缘可能被画面裁切" if c["near_edge"] else ""
-        seg.append(f"{c['name']}（{vert}、{depth_label}、{size_txt}、{c['side']}、{c['facing_desc']}、{c['plan_dir']}{edge}）")
+        _dm = c.get("depth_m")
+        _dist_txt = f"距镜头约{_dm:.1f}米、{_size_note(_dm, cam['fov'])}、" if _dm else ""
+        seg.append(f"{c['name']}（{vert}、{depth_label}、{_dist_txt}{size_txt}、{c['side']}、{c['facing_desc']}、{c['plan_dir']}{edge}）")
     if seg:
         title = "【人物站位·初始画面入画名单（0秒时刻，从近到远）】" if dynamic else "【人物站位·入画名单（从近到远）】"
         lines.append(title + "（本名单中的「画面左/右」＝成片图像里观众看到的左/右，"
@@ -2404,25 +2459,25 @@ _SHOT_BRIEF_CACHE: dict[str, dict] = {}   # key = sha1(plot+画面描述+dynamic
 
 SHOT_TRANSLATE_SYSTEM_PROMPT = """你是资深摄影指导兼镜头翻译官。输入有两部分：
 ①调度图纸的坐标数据（俯视图，0-1 归一化坐标：x 右为正、y 下为正；camera=机位位置/朝向/视锥，facing 0=图纸上方、90=右方、180=下方、270=左方；characters=人物位置/朝向/轨迹；props=陈设，含朝向 facing：0=图纸上方、顺时针，如门/床/柜的开口朝向）；
-②程序按坐标算好的机位几何事实（visible=入画名单已按离镜头由近到远排序，含每人的 depth_rank 近远次序、size_percent 画面大小百分比、frame_side 画面左右、facing 身体朝向、near_edge 是否贴近视野边缘；hidden=绝不入画名单）。
+②程序按坐标算好的机位几何事实（visible=入画名单已按离镜头由近到远排序，含每人的 depth_rank 近远次序、size_percent 画面大小百分比、dist_m 距镜头真实米数、size_note 该距离下全身在画面中的高度占比锚点、frame_side 画面左右、facing 身体朝向、near_edge 是否贴近视野边缘；hidden=绝不入画名单）。
 
 几何事实是权威，不可更改：谁入画谁不入画、近远次序、大小百分比、画面左右、身体朝向一律照抄，禁止用你的直觉重算或调换。
 你只做"画面语言化"——把事实翻译成文生图/图生视频模型听得懂的画面描述：
 1. shot：按画面描述推断景别（特写/近景/中景/全景/远景）；机位高度与镜头夹角必须照抄输入 camera.height_desc 与 camera.pitch_desc（程序按导演设定的机位高度与镜头俯仰换算，如"平拍（与人眼等高）""大俯角（镜头朝下45°）"），禁止自行推断；再加一句话构图。
-2. characters：给每个入画人物写 frame_position（按 depth_rank：最近者"画面下缘/前景"，最远者"画面上缘地平线/远景深处"，中间者"画面纵深中部"，再叠加 frame_side 的左右）、depth_label（前景/中景/背景）、occlusion（按坐标间距判断谁可能被谁部分遮挡，没有就空串）、spacing（与其他人物的间距语义，如"与小美并排、间隔约一步""独自远离人群半个画面"）、presentation（结合画面描述写这个人物在镜头里的一句话呈现：姿势/在做什么/情绪，服从画面描述，不新增剧情；并把该人物的 facing 落成具体可视描述写进 presentation，例如"背对镜头"→"只见后脑勺与背影"、"侧对镜头"→"侧脸朝向画面右"）。
+2. characters：给每个入画人物写 frame_position（按 depth_rank：最近者"画面下缘/前景"，最远者"画面上缘地平线/远景深处"，中间者"画面纵深中部"，再叠加 frame_side 的左右）、depth_label（前景/中景/背景）、size_note（照抄输入事实，禁止改写或省略）、occlusion（按坐标间距判断谁可能被谁部分遮挡，没有就空串）、spacing（与其他人物的间距语义，如"与小美并排、间隔约一步""独自远离人群半个画面"）、presentation（结合画面描述写这个人物在镜头里的一句话呈现：姿势/在做什么/情绪，服从画面描述，不新增剧情；人物在画面中的大小必须与 size_note 的距离占比锚点一致——dist_m 近（如 1.5 米内、占比大）可以写前景/贴近镜头，dist_m 远就严禁写"凑近镜头/贴近镜头/探到镜头前/脸部占满画面"之类与距离矛盾的前景化描写；并把该人物的 facing 落成具体可视描述写进 presentation，例如"背对镜头"→"只见后脑勺与背影"、"侧对镜头"→"侧脸朝向画面右"）。
 3. excluded：照抄 hidden 名单与理由。
 4. layout_summary：整幅画面布局一句话（谁前谁后、谁大谁小、谁在哪一侧、画面主体是谁）。
 5. 若提供了运动轨迹（dynamic=true 时），在 presentation 里补一句该人物初始帧之后的运动意向（走位方向、靠近/远离镜头），并在 layout_summary 里补镜头运动（若有）。
 
 只输出一个 JSON 对象，schema：
 {"shot":{"type":"景别","camera_height":"机位高度","composition":"构图一句话"},
- "characters":[{"name":"...","in_frame":true,"frame_position":"...","depth_label":"前景/中景/背景","size_percent":100,"frame_side":"照抄","facing":"照抄","occlusion":"","spacing":"","presentation":""}],
+ "characters":[{"name":"...","in_frame":true,"frame_position":"...","depth_label":"前景/中景/背景","size_percent":100,"size_note":"照抄","frame_side":"照抄","facing":"照抄","occlusion":"","spacing":"","presentation":""}],
  "excluded":[{"name":"...","reason":"照抄"}],
  "layout_summary":"..."}
-size_percent 与 frame_side、facing 必须与输入事实逐字一致。facing 是硬性视觉约束：写"完全背对镜头"的人画面里绝不能出现他的脸（只能后脑勺与背影）；写"正面对镜头"的人必须正脸朝观众。"""
+size_percent、size_note 与 frame_side、facing 必须与输入事实逐字一致。facing 是硬性视觉约束：写"完全背对镜头"的人画面里绝不能出现他的脸（只能后脑勺与背影）；写"正面对镜头"的人必须正脸朝观众。"""
 
 
-async def synthesize_shot_brief(plot: dict, scene_desc: str, dynamic: bool) -> dict | None:
+async def synthesize_shot_brief(plot: dict, scene_desc: str, dynamic: bool, aspect: float = 16 / 9) -> dict | None:
     """把调度图坐标+程序几何事实交给 DeepSeek，产出统一的"镜头画面 JSON"。
     结果按内容哈希缓存（拖拽/移机位/改描述才会重算）；任何失败返回 None（调用方回退程序直译）。"""
     import hashlib
@@ -2432,14 +2487,14 @@ async def synthesize_shot_brief(plot: dict, scene_desc: str, dynamic: bool) -> d
         return None
     try:
         key = hashlib.sha1(json.dumps(
-            {"plot": plot, "desc": (scene_desc or "")[:500], "dyn": bool(dynamic), "v": 3},
+            {"plot": plot, "desc": (scene_desc or "")[:500], "dyn": bool(dynamic), "asp": round(float(aspect), 2), "v": 4},
             sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
     except Exception:
         return None
     if key in _SHOT_BRIEF_CACHE:
         return _SHOT_BRIEF_CACHE[key]
 
-    facts = compute_camera_facts(plot)
+    facts = compute_camera_facts(plot, aspect)
     compact = {
         "camera": {"x": round(facts["camera"]["x"], 3), "y": round(facts["camera"]["y"], 3),
                    "facing": facts["camera"]["facing"], "fov": facts["camera"]["fov"],
@@ -2460,6 +2515,8 @@ async def synthesize_shot_brief(plot: dict, scene_desc: str, dynamic: bool) -> d
     }
     facts_txt = {
         "visible": [{"name": c["name"], "depth_rank": i + 1, "size_percent": c["size_pct"],
+                     "dist_m": round(c.get("depth_m", 0.0), 1),
+                     "size_note": _size_note(c.get("depth_m", 0.0), facts["camera"]["fov"]),
                      "frame_side": c["side"], "facing": c["facing_desc"], "near_edge": c["near_edge"]}
                     for i, c in enumerate(facts["visible"])],
         "hidden": [{"name": c["name"], "reason": c["reason"]} for c in facts["hidden"]],
@@ -2526,7 +2583,8 @@ def _validate_shot_brief(data: Any, facts: dict, dynamic: bool) -> dict | None:
         out_chars.append({
             "name": name, "in_frame": True, "frame_position": fp, "depth_label": depth_label,
             "depth_rank": rank, "size_percent": fc["size_pct"], "frame_side": prog_side,
-            "facing": fc["facing_desc"],
+            "facing": fc["facing_desc"], "size_note": _size_note(fc.get("depth_m", 0.0), facts["camera"]["fov"]),
+            "dist_m": round(fc.get("depth_m", 0.0), 1),
             "occlusion": str(item.get("occlusion") or "").strip()[:80],
             "spacing": str(item.get("spacing") or "").strip()[:80],
             "presentation": str(item.get("presentation") or "").strip()[:150],
@@ -2540,7 +2598,8 @@ def _validate_shot_brief(data: Any, facts: dict, dynamic: bool) -> dict | None:
             "name": fc["name"], "in_frame": True,
             "frame_position": fc["side"], "depth_label": "前景" if idx == 0 else ("背景" if idx == n - 1 else "中景"),
             "depth_rank": idx + 1, "size_percent": fc["size_pct"], "frame_side": fc["side"],
-            "facing": fc["facing_desc"], "occlusion": "", "spacing": "", "presentation": ""})
+            "facing": fc["facing_desc"], "size_note": _size_note(fc.get("depth_m", 0.0), facts["camera"]["fov"]),
+            "occlusion": "", "spacing": "", "presentation": ""})
     out_excluded, ex_seen = [], set()
     for item in data.get("excluded") or []:
         if not isinstance(item, dict):
@@ -2580,6 +2639,10 @@ def render_shot_brief_text(brief: dict) -> str:
         seg = []
         for c in chars:
             parts = [c["frame_position"], f"{c['depth_label']}(第{c['depth_rank']}近)"]
+            if c.get("size_note"):
+                if c.get("dist_m"):
+                    parts.append(f"距镜头约{c['dist_m']}米")
+                parts.append(c["size_note"])
             if c["size_percent"] and c["size_percent"] < 100:
                 parts.append(f"大小约为最近者的{c['size_percent']}%")
             elif c["size_percent"]:
@@ -2607,25 +2670,25 @@ def render_shot_brief_text(brief: dict) -> str:
     return "\n".join(lines) + "\n"
 
 
-async def build_plot_prompt_text(plot: dict, scene_desc: str, dynamic: bool = False) -> str:
+async def build_plot_prompt_text(plot: dict, scene_desc: str, dynamic: bool = False, aspect: float = 16 / 9) -> str:
     """调度图→提示词文本的统一入口：优先 AI 镜头翻译（缓存），失败回退程序直译。"""
-    brief = await synthesize_shot_brief(plot or {}, scene_desc, dynamic)
+    brief = await synthesize_shot_brief(plot or {}, scene_desc, dynamic, aspect)
     if brief:
         text = render_shot_brief_text(brief)
         # AI 翻译只覆盖人物（入画名单/落位/朝向），门窗家具的画面落位由程序按机位几何直译补充
-        _pf = _prop_frame_lines(plot or {})
+        _pf = _prop_frame_lines(plot or {}, aspect)
         if _pf:
             text += _pf + "\n"
         # 人物与织布机等大件陈设的前后关系也说破（AI 翻译不输出这类相对关系）
-        _rel = _char_prop_relations(plot or {}, compute_camera_facts(plot or {}))
+        _rel = _char_prop_relations(plot or {}, compute_camera_facts(plot or {}, aspect))
         if _rel:
             text += _rel + "\n"
         # 空间比例锁定（米制）：人物间距/离陈设/离墙/陈设占地全部写成米数
-        _sp = _spatial_lock_lines(plot or {}, compute_camera_facts(plot or {}))
+        _sp = _spatial_lock_lines(plot or {}, compute_camera_facts(plot or {}, aspect))
         if _sp:
             text += _sp + "\n"
         # 轨迹/走位仍由程序直译补充（AI 只管初始帧画面语言；运动路线公式简单稳定，无需 AI）
-        det = format_plot_to_prompt(plot or {}, dynamic=dynamic)
+        det = format_plot_to_prompt(plot or {}, dynamic=dynamic, aspect=aspect)
         det_moves = ""
         for ln in det.splitlines():
             if ln.startswith("【运动路线】") or ln.startswith("【人物站位·初始不在画面名单"):
@@ -2633,7 +2696,7 @@ async def build_plot_prompt_text(plot: dict, scene_desc: str, dynamic: bool = Fa
         if dynamic and det_moves:
             text += "【运动路线与初始出画名单（程序按坐标直译，权威）】\n" + det_moves
         return text
-    return format_plot_to_prompt(plot or {}, dynamic=dynamic)
+    return format_plot_to_prompt(plot or {}, dynamic=dynamic, aspect=aspect)
 
 
 def _load_cn_font(size: int):
@@ -3193,7 +3256,7 @@ def _fact_side(side_text: str) -> str:
     return ""
 
 
-def _prop_view_states(plot: dict) -> list:
+def _prop_view_states(plot: dict, aspect: float = 16 / 9) -> list:
     """每个陈设的机位视野状态：是否入画、画面左右（与 _hidden_props_note 同一套几何口径）。"""
     import math
     cam = plot.get("camera") or {}
@@ -3202,7 +3265,7 @@ def _prop_view_states(plot: dict) -> list:
     cx, cy = float(cam.get("x", 0.5)), float(cam.get("y", 0.95))
     rad = math.radians(float(cam.get("facing") or 0) % 360)
     fx, fy = math.sin(rad), -math.cos(rad)
-    fov = float(cam.get("fov") or 55)
+    _half = _half_h_fov(cam, aspect)
     out = []
     for p in (plot.get("props") or []):
         label = str(p.get("label") or p.get("name") or "").strip()
@@ -3216,9 +3279,9 @@ def _prop_view_states(plot: dict) -> list:
         depth = vx * fx + vy * fy
         angle = math.degrees(math.acos(max(-1.0, min(1.0, depth / dist))))
         cross = fx * vy - fy * vx
-        ok = depth > 0 and dist > 0.15 and angle <= fov / 2 + 25
+        ok = depth > 0 and dist > 0.15 and angle <= _half + 25
         out.append({"label": label, "in_view": ok,
-                    "side": _frame_side_text(cross, dist, fov) if ok else ""})
+                    "side": _frame_side_text(cross, dist, _half) if ok else ""})
     return out
 
 
@@ -3626,7 +3689,7 @@ async def generate_image(req: ImageRequest):
         # 实测门从场景图漏进画面右缘）：有调度数据时给场景参考说明追加取舍规则——
         # 视野外的门窗严禁入画，陈设位置以调度图纸为准
         if req.plot_data:
-            _scene_note = _hidden_props_note(req.plot_data)
+            _scene_note = _hidden_props_note(req.plot_data, _aspect_from_size(req.size))
             if _scene_note:
                 for _i in range(len(metas)):
                     if isinstance(metas[_i], dict) and str(metas[_i].get("kind") or "") == "scene":
@@ -3709,6 +3772,11 @@ async def generate_image(req: ImageRequest):
             directive += (
                 "门窗等固定元素：相对位置不得移动（门在哪面墙、窗在哪面墙，画出来还必须在原位置），"
                 "但朝向可以随本镜视角旋转（按透视自然呈现）；\n"
+                "【画面大小·只认距离】特写、前景大脸等镜头语言本身是允许的，但前提只有一个："
+                "导演台数据里这个人真的站在紧贴机位处（坐标翻译会明确写出\"距镜头约X米、全身约占画面高度Y\"）。"
+                "距离数据说他远（如 4 米以外、全身约占画面高度二分之一或更小），就严禁画成贴近镜头的大特写、"
+                "半脸插入或局部大脸——画面中的大小只由距镜头远近决定（远小近大），与戏剧情绪、谁在说话无关；"
+                "戏剧张力要用景别、光线、表情去表达，不能用违反空间距离的构图去表达。\n"
                 "所有参考图（角色/场景/服装/道具设定图）只提供外观结构参考：长相、发型、服装款式、"
                 "陈设样式、材质、色调——严禁参考任何参考图里的朝向角度、站位姿态与拍摄视角"
                 "（设定图都是在各自固定机位画的样板照，与导演台数据的空间关系冲突时，一律以导演台为准）。\n"
@@ -3754,7 +3822,8 @@ async def generate_image(req: ImageRequest):
             # 坐标翻译：生图模型看不懂俯视图纸上的图标，但听得懂"谁离镜头最近/在哪侧/谁不入画/朝哪边"。
             # 优先 AI 镜头翻译（按坐标+程序几何事实产出，内容哈希缓存），失败自动回退程序直译。
             plot_txt = await build_plot_prompt_text(
-                req.plot_data or {}, (req.prompt or "") + " " + (req.context or ""), dynamic=False)
+                req.plot_data or {}, (req.prompt or "") + " " + (req.context or ""), dynamic=False,
+                aspect=_aspect_from_size(req.size))
             if plot_txt:
                 directive += "【坐标翻译（铁律的空间事实明细，程序按坐标计算）】\n" + plot_txt + "\n"
             # 导演在重写框里直接指定的画面落位（画面右上角/偏右/居中…）＝导演显式构图指令，
@@ -4854,7 +4923,8 @@ async def generate_video(req: VideoRequest, request: Request):
     if req.plot_data:
         # dynamic=True：名单只约束初始帧，后续人物进出场按走位与镜头运动推演（视频有时间轴，与单帧分镜图不同）
         # 顶层镜头翻译：DeepSeek 按坐标+程序几何事实产出"镜头画面 JSON"（含运动意向），失败自动回退程序直译
-        plot_txt = await build_plot_prompt_text(req.plot_data, prompt, dynamic=True)
+        plot_txt = await build_plot_prompt_text(req.plot_data, prompt, dynamic=True,
+                                                aspect=float(req.image_aspect) if req.image_aspect else 16 / 9)
         if plot_txt:
             prompt = (f"{prompt}\n\n【运动轨迹指令】（由导演定稿的调度图纸坐标翻译而来，"
                       f"人物走位、运动快慢、身体朝向与镜头运动必须严格遵守）\n{plot_txt}\n"
@@ -4866,7 +4936,7 @@ async def generate_video(req: VideoRequest, request: Request):
                       "白底俯视调度图纸类参考图仅用于理解走位方向与机位关系，"
                       "严禁把图纸本身、白底平面图、人偶棋子图标、扇形视锥、虚线箭头画进视频画面。")
             # 视野外陈设黑名单：同生图链路，防场景设定图里的门窗被视频抄进画面
-            _hn = _hidden_props_note(req.plot_data or {})
+            _hn = _hidden_props_note(req.plot_data or {}, float(req.image_aspect) if req.image_aspect else 16 / 9)
             if _hn:
                 prompt += "\n" + _hn
 
