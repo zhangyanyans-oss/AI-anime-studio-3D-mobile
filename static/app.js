@@ -737,6 +737,8 @@ function applyStory(story) {
     dialogue: sb.dialogue || "",
     duration: sb.duration || 3,
     image_prompt: sb.image_prompt || "",
+    image_prompt_ai: sb.image_prompt || "",   // AI 生成原文基线：用户手改后 image_prompt_edited 置 true（P2 手改 > P3 AI 兜底）
+    image_prompt_edited: false,
     video_prompt: sb.video_prompt || "",
     images: [],
     videoUrl: null,
@@ -826,7 +828,7 @@ async function syncBoardsToStory() {
         feedback: "按最新剧情梗概与画风圣经整体校准本镜头：剧情走向与人物行为符合新梗概；美术风格/光源/影调/氛围严格按新画风圣经重写；保留本镜头原有的叙事作用、景别与构图要点。",
       });
       const oldImg = b.image_prompt || "", oldVid = b.video_prompt || "";
-      if (r.image_prompt) { b.image_prompt = keepParams(r.image_prompt, oldImg); ok++; }
+      if (r.image_prompt) { b.image_prompt = keepParams(r.image_prompt, oldImg); b.image_prompt_ai = b.image_prompt; b.image_prompt_edited = false; ok++; }
       if (r.video_prompt) b.video_prompt = keepParams(r.video_prompt, oldVid);
       touch();
     } catch (e) { fail++; }
@@ -2101,7 +2103,10 @@ function livePromptSync(bid, kind, v) {
   const b = board(bid);
   if (!b) return;
   const params = kind === "img" ? SHEET_PARAMS.img : SHEET_PARAMS.video;
-  if (kind === "img") b.image_prompt = applyParams(v, params);
+  if (kind === "img") {
+    b.image_prompt = applyParams(v, params);
+    if ((b.image_prompt || "").trim() !== String(b.image_prompt_ai || "").trim()) b.image_prompt_edited = true;  // 与 AI 原文不同＝手改（P2）
+  }
   else b.video_prompt = applyParams(v, params);
   b.shot_params = { img: { ...SHEET_PARAMS.img }, video: { ...SHEET_PARAMS.video } };
   touch(); // 1.2s 防抖自动落盘
@@ -2116,6 +2121,7 @@ function saveBoardDraft(bid) {
   b.linkPrev = !!($("bd-linkprev") || {}).checked;
   b.shot_params = { img: { ...SHEET_PARAMS.img }, video: { ...SHEET_PARAMS.video } };
   b.image_prompt = applyParams($("bd-imgp").value.trim(), SHEET_PARAMS.img);
+  if ((b.image_prompt || "").trim() !== String(b.image_prompt_ai || "").trim()) b.image_prompt_edited = true;
   b.video_prompt = applyParams($("bd-vidp").value.trim(), SHEET_PARAMS.video);
   touch(); saveNow(); toast("已保存（弹窗保持打开）");
 }
@@ -2146,6 +2152,7 @@ async function aiRewriteBoard(bid) {
     b.description = desc; b.dialogue = dialogue; b.duration = duration;  // 框内改动一并写回
     b.shot_params = { img: { ...SHEET_PARAMS.img }, video: { ...SHEET_PARAMS.video } };
     b.image_prompt = applyParams(keepParams(r.image_prompt || oldPrompt || b.image_prompt, oldPrompt), SHEET_PARAMS.img);
+    b.image_prompt_ai = b.image_prompt; b.image_prompt_edited = false;   // AI 重写＝回到 AI 原文基线
     if (r.video_prompt) b.video_prompt = applyParams(keepParams(r.video_prompt, oldVidPrompt), SHEET_PARAMS.video);
     hideBusy(); touch(); openBoardSheet(bid);
     toast("提示词已重写");
@@ -2458,7 +2465,7 @@ function resolveAssetRefs(b, onlyVid) {
     if (!named) continue;
     seen.add(sc.image_url);
     out.push({ url: sc.image_url, meta: { kind: "scene", name: sc.name,
-      description: `视频提示词提到的场景「${sc.name}」设定图：陈设的种类、样式、空间结构与光线氛围以此图为基准（左墙的柜子仍在左墙），但此图是在固定机位画的样板照、**不锁定拍摄视角**——画面视角仍按本镜机位与首帧构图执行，须把房间想象成从机位方向看出去的透视图；人物动作、人数与画面构图仍以提示词和分镜图为准，不得把本图里的人物画进画面${sc.image_prompt ? "。" + sc.image_prompt : ""}` } });
+      description: `视频提示词提到的场景「${sc.name}」设定图：外观结构参考（陈设样式/材质/相对方位），不提供朝向角度与拍摄视角，空间几何按本镜机位与首帧构图执行${sc.image_prompt ? "。" + sc.image_prompt : ""}` } });
   }
   return out;
 }
@@ -2507,15 +2514,13 @@ async function genBoardImage(bid) {
   if (b.previewShot && b.previewShot.startsWith("data:image")) {
     urls.push(b.previewShot);
     meta.push({ kind: "shot_preview", name: "机位预览", description:
-      "导演 3D 导演台的机位预览（从镜头位置实时渲染的本镜构图）：最终画面的人物站位、画面左右、远近大小层次、身体朝向、谁被谁遮挡、机位高度与视角必须与此图一致——此图就是成片应该达到的构图。"
-      + "【视角权威】房间的透视取景也以此图为准：墙面朝向与倾斜、消失点方向、地板与天花板的透视变形、门窗户在画面中的方位，都按本图的机位视角画；场景设定图给的是另一个方向看房间的样板照，其拍摄视角严禁照搬，须把房间『旋转』到本图机位方向重新取景。"
-      + "但此图中的彩色胶囊、方块、锥体只是站位示意模型：人物的真实长相、发型、服装一律按角色设定图与提示词执行，家具门窗的真实样式按场景设定图与提示词执行；"
-      + "严禁把胶囊人偶、几何方块、琥珀色锥体等示意元素画进画面；画风、光线、色调按画风设定与提示词执行，不参照本图的示意渲染风格。" });
+      "导演 3D 导演台的机位预览＝从真实机位渲染的本镜画面，空间几何铁律的权威依据：人物站位/画面左右/远近大小/朝向/遮挡/机位视角以此图为准。"
+      + "图中彩色胶囊、方块、锥体只是站位示意，严禁画进画面；人物长相服装按角色设定图，家具门窗样式按场景设定图，画风光线按画风设定。" });
   }
   // 本镜头手动上传的参考图（构图/氛围参考），紧跟调度图之后，优先于角色/场景设定图
   for (const u of b.ref_images || []) {
     urls.push(u);
-    meta.push({ kind: "ref", name: "镜头参考", description: "导演为本镜上传的参考图：机位、人物在画面里的位置与朝向、姿势、家具陈设以本图为准。但图里的人物只是「同一个人」的姿势参考——不得因为参考图里出现某人就额外再画一个：画面最终人数与各人状态必须与提示词一致（提示词说父亲卧床虚化，就只画一个卧床的父亲，本图里的站姿不采用）。人物长相仍以角色设定图为准。" });
+    meta.push({ kind: "ref", name: "镜头参考", description: "导演为本镜上传的参考图：机位、人物在画面里的位置与朝向、姿势、家具陈设可参考本图。但图中出现的人物不自动入画——画面最终人数与各人状态必须与提示词一致，人物长相仍以角色设定图为准。" });
   }
   // 接上一镜：上一镜头最后一帧作为衔接锚点（连续镜头：场景/人物/光线无缝延续）
   if (b.linkPrev) {
@@ -2608,7 +2613,7 @@ async function genBoardImage(bid) {
       for (const sc of st.scenes || [])
         if (parts.some((p) => nameHit(p, sc.name))) {
           const brief = furnitureBrief(sc.furniture);
-          const desc = `提示词中以中括号引用的场景「${sc.name}」官方设定图。注意：此图只锁定陈设的种类、样式、材质、色调与相对方位（左墙的柜子还在左墙），**不锁定拍摄视角**——设定图是站在一个固定机位画的，本镜机位很可能在另一个方向，画面必须按本镜机位重新取景：想象自己走到调度图机位的位置环视这个房间，把看到的透视图画出来（近大远小、墙面倾斜与消失点、地板天花板透视变形都按机位视角算），陈设样式照抄本图即可${sc.image_prompt || sc.description || ""}${brief}`;
+          const desc = `提示词中以中括号引用的场景「${sc.name}」官方设定图（外观结构参考：陈设样式、材质、色调与相对方位；不提供朝向角度与拍摄视角，空间几何一律按铁律/导演台数据）${sc.image_prompt || sc.description || ""}${brief}`;
           if (pushRef(sc, "scene", "场景", "", desc)) hitNames.add(sc.name);
         }
       for (const p2 of st.props || [])
@@ -2671,7 +2676,7 @@ async function genBoardImage(bid) {
       if (!(picked && picked.has(o.name)) && !named) continue;
       addedImgs.add(o.image_url);
       urls.push(o.image_url);
-      meta.push({ kind: "character", outfit: true, name: c.name, description: `角色「${c.name}」的${o.name ? `「${o.name}」` : ""}服装设定图（同一人物换装，仅服装不同，面部/发型/体型与本体设定图一致）：${o.image_prompt || ""}` });
+      meta.push({ kind: "character", outfit: true, name: c.name, description: `角色「${c.name}」的${o.name ? `「${o.name}」` : ""}服装设定图（同一人物换装）：本镜只穿本图这套服装，严禁换成该角色的其它服装、严禁两套混穿；面部/发型/体型与本体设定图一致：${o.image_prompt || ""}` });
     }
   }
   // 场景：只送本镜真正写到的那个场景。名字按全名或尾部 2 字匹配（"木兰家堂屋" ← 正文写"堂屋"），
@@ -2685,7 +2690,7 @@ async function genBoardImage(bid) {
   for (const sc of sceneMatched) if (!addedImgs.has(sc.image_url)) {
     urls.push(sc.image_url);
     meta.push({ kind: "scene", name: sc.name,
-      description: "场景「" + sc.name + "」设定图：只锁陈设样式、材质与相对方位，不锁定拍摄视角——画面按本镜机位重新取景（想象绕到机位方向环视房间画透视图）。"
+      description: "场景「" + sc.name + "」设定图（外观结构参考：陈设样式/材质/相对方位；不提供朝向角度与拍摄视角，空间几何按铁律执行）"
         + (sc.image_prompt || sc.description || "") + furnitureBrief(sc.furniture) });
   }
   // 入画人物硬约束：提示词里点了名，就把名单钉死在 prompt 里（参考图已按名单过滤，这里再加一道文字闸）。
@@ -2694,8 +2699,8 @@ async function genBoardImage(bid) {
   const castList = [...castNames];
   const castNote = castFromText && castList.length
     ? `【入画人物锁定】本镜头设定图角色名单：${castList.join("、")}（共 ${castList.length} 人）——名单角色的长相与服装以对应参考图为准，名单里的人一个都不能少。`
-      + `提示词正文明确写到的人物（宫人、侍卫、宾客、商贩等群演配角）必须按正文画出，数量与正文一致；`
-      + `正文没写到的无名人影（背景路人、围观群众等）一律不画，也不得因参考图里有人就照搬进画面。\n\n`
+      + `提示词正文明确写到的人物必须按正文画出，数量与正文一致；`
+      + `正文没写到的无名人影一律不画，也不得因参考图里有人就照搬进画面。\n\n`
     : "";
   const refs = { reference_urls: urls.slice(0, 9), reference_meta: meta.slice(0, 9) };
   const sendPrompt = castNote + (b.image_prompt || "");
@@ -2708,6 +2713,7 @@ async function genBoardImage(bid) {
       // 参考模式不传，后端跳过硬约束，图纸只作大致参考
       plot_data: (diagPlot && stagingModeOf(b) === "precise") ? diagPlot : undefined,
       diagram_brief: diagBrief || undefined,
+      prompt_edited: b.image_prompt_edited === true,   // P2 手改提示词 > P3 AI 兜底（后端按此注入优先级声明）
     });
     b.images.push(r.image_url);
     // 出图后把本次真正送进模型的参考图名单亮出来（角色/场景/道具/调度图/末帧）。
